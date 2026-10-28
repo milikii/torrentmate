@@ -1,0 +1,355 @@
+[en]
+WELCOME_SUPER_USER=Welcome, your account was added as super user
+WELCOME_NEW_USER=Welcome {}! You have been granted access.
+ACCESS_RESTRICTED=You are not authorized to use this bot. Please contact bot owner to get access.
+TORRENT_REMOVED=Torrent {} was removed from Transmission server
+TORRENT_REMOVED_WITH_DATA=Torrent removed and files deleted: {}
+TORRENT_REMOVED_KEEP_DATA=Torrent removed, files kept: {}
+HELP=Use the buttons below or commands to manage Transmission:
+     - Send magnet links (one or many) or .torrent files to start a download
+     - /torrents list  /status server status  /history download history
+     - /rules classify rules  /classify test a name  /speed speed limit
+HELP_ADMIN=Admin commands:
+           /adduser, issue an invite link (valid for 15 minutes)
+DOING_SEARCH=Please wait, searching:
+NAV_HEADER=Search: page {} of {} (total: {} posts):
+           -------------------------
+NO_SEARCH_RESULTS=No search history yet. Just send a keyword, for example: Interstellar
+NOTHING_FOUND=Unfortunately, nothing found for your query.
+CHOOSE_DOWNLOAD_DIR=Please choose a download folder for "{}":
+ADDING_TORRENT_FILE_WILL_BE_DOWNLOADED=File will be downloaded into {}
+ADDING_TORRENT_FILE_IS_CORRUPTED=File is corrupted or the link does not contain a torrent file. Possible reasons:
+                                 - the tracker requires authorization
+                                 - website or file is not accessible
+                                 - corrupted or wrong file
+ADDING_FILE_SOMETHING_WENT_WRONG=Failed to add the torrent
+SOMETHING_WENT_WRONG=Something went wrong
+DOWNLOAD_COMPLETED=Download completed: {}
+TORRENT_INFO_PAGE_HEADER=page {} of {} ({} files)
+TORRENT_LIST_HEADER=Torrents list: page {} of {} ({} files):
+DOWNLOAD_HISTORY_NAV=History: page {} of {} ({} items)
+                    ---------------------
+PROGRESS_STATUS=Progress: {0}, Status: {1}
+BAD_PAGE_ACCESS=Page not found. Use bot menu or search again. Probably bot was restarted
+FAILED_INIT_TRACKERS=Check logs and config file. Not initialized trackers:
+FAILED_SEARCH_ON_TRACKERS=Failed search on trackers:
+HOWTO_DOWNLOAD_MAGNET_LINK=Copy and paste link into your torrent client
+ALL_STOPPED=All torrents paused
+ALL_STARTED=All torrents started
+UNSUPPORTED_MIME_TYPE=This message type is not supported
+MESSAGE_IS_TOO_LONG=Search query is too long, please use 256 characters or less
+status.downloading=downloading
+status.seeding=seeding
+status.stopped=paused
+status.checking=checking
+status.check_pending=check pending
+status.download_pending=download pending
+status.seed_pending=seed pending
+BATCH_FOUND=Found {} magnet links:
+BATCH_ITEM_UNKNOWN={}. Unnamed torrent ({}...) - will be classified after metadata is fetched
+BATCH_MANUAL=selected folder
+BATCH_MORE=...and {} more
+BATCH_NAME_HINT=Some links have no dn parameter; they will be classified automatically once metadata arrives.
+BATCH_CHOOSE=Choose how to save: tap Auto classify, or pick a folder.
+BATCH_ADDING=Adding {}/{} ...
+BATCH_RESULT=Added {} of {} torrents
+BATCH_DUPLICATES=Skipped {} duplicate(s): {}
+BATCH_FAILED=Failed: {}
+BATCH_TIPS=Progress will be updated live and you will get a notification when done.
+AUTO_CLASSIFY_ON=Auto classified by name. To force a folder, send it again and pick a folder.
+CARD_TITLE=<b>{}</b>
+CARD_STATUS=Status: {}
+CARD_DIR_INLINE=<code>{}</code>
+CARD_METADATA=Fetching torrent metadata...
+CARD_PROGRESS={} {}
+CARD_SIZE={} / {}
+CARD_SPEED=Down {} | Up {}
+CARD_PEERS=Peers {} | Ratio {}
+CARD_ETA=ETA {}
+DONE_TITLE=Download completed
+DONE_DIR=Folder {}
+DONE_SIZE=Size {}
+DONE_SPEED=Took {} | Avg {}
+DONE_RATIO=Ratio {}
+BTN_DETAILS=Details
+BTN_DEL_KEEP=Delete torrent
+BTN_DEL_DATA=Delete torrent + files
+MILESTONE={} reached {} percent
+STALLED={} has had no progress for {} minutes (at {}, speed {}). Check trackers or peers.
+TORRENT_ERROR={} failed: {}
+PAUSED_ON_COMPLETE=Paused seeding after completion as configured.
+CLASSIFIED={} was moved to {} (rule: {})
+CLASSIFY_FAILED=Failed to move {}: {}
+STATUS_TITLE=Transmission status
+STATUS_TASKS=Torrents: {} (downloading {}, seeding {}, paused {})
+STATUS_SPEED=Speed: down {} | up {}
+STATUS_SESSION=This session: down {} | up {}
+STATUS_TOTAL=All time: down {} | up {}
+STATUS_LIMIT=Global limit: down {} | up {}
+STATUS_DISK=Free space:
+STATUS_FREE=free {}
+SPEED_USAGE=Usage: /speed 5M 1M (down and up, KB/s, K/M/G allowed)
+            /speed off to remove the limit
+            Current: {}
+SPEED_OFF=Global speed limit removed
+SPEED_SET=Global speed limit set: down {} | up {}
+SPEED_CURRENT=down {} | up {}
+SPEED_UNLIMITED=unlimited
+RULES_TITLE=Classify rules (checked in order, first match wins)
+RULES_HINT=Edit the auto_classify section of config/torrentino.yaml, no restart needed.
+           Test with /classify <name>
+CLASSIFY_USAGE=Usage: /classify SSIS-123
+CLASSIFY_RESULT=Name: {}
+               Category: {}
+               Rule: {} ({})
+               Target folder: {}
+[zh]
+WELCOME_SUPER_USER=欢迎，你的账号已被设为超级管理员
+WELCOME_NEW_USER=欢迎 {}！你已获得使用权限。
+ACCESS_RESTRICTED=你没有使用权限，请联系管理员开通。
+TORRENT_REMOVED=🗑 任务已删除：{}
+TORRENT_REMOVED_WITH_DATA=🗑 已删除任务并清理文件：{}
+TORRENT_REMOVED_KEEP_DATA=🗑 已删除任务，文件已保留：{}
+HELP=用底部按钮或命令管理 Transmission：
+     • 直接发送磁力链接（可一次发多条）或 .torrent 文件即可开始下载
+     • /torrents 任务列表 ｜ /status 服务器状态 ｜ /history 下载历史
+     • /rules 分类规则 ｜ /classify 测试分类 ｜ /speed 全局限速
+     发送关键词即可搜索支持的站点。
+HELP_ADMIN=管理员命令：
+           /adduser 生成邀请链接（15 分钟内有效，一次性）
+DOING_SEARCH=正在搜索：
+NAV_HEADER=🔎 搜索结果：第 {} / {} 页（共 {} 条）
+           -------------------------
+NO_SEARCH_RESULTS=还没有搜索记录。直接发送关键词试试，例如：流浪地球
+NOTHING_FOUND=没有找到相关结果。
+CHOOSE_DOWNLOAD_DIR=请选择《{}》的保存目录：
+ADDING_TORRENT_FILE_WILL_BE_DOWNLOADED=文件将保存到 {}
+ADDING_TORRENT_FILE_IS_CORRUPTED=❌ 文件损坏，或链接并不是种子文件。可能原因：
+                                 - 站点需要登录鉴权
+                                 - 站点或文件无法访问
+                                 - 文件损坏或类型不对
+ADDING_FILE_SOMETHING_WENT_WRONG=❌ 添加失败
+SOMETHING_WENT_WRONG=出错了
+DOWNLOAD_COMPLETED=下载完成：{}
+TORRENT_INFO_PAGE_HEADER=第 {} / {} 页（共 {} 个文件）
+TORRENT_LIST_HEADER=📁 任务列表：第 {} / {} 页（共 {} 个任务）
+DOWNLOAD_HISTORY_NAV=🕑 下载历史：第 {} / {} 页（共 {} 条）
+                    ---------------------
+PROGRESS_STATUS=进度 {0} ｜ 状态 {1}
+BAD_PAGE_ACCESS=页面已失效，请重新发送 /torrents 或重新搜索（机器人可能重启过）。
+FAILED_INIT_TRACKERS=⚠️ 以下站点初始化失败，请检查配置与日志：
+FAILED_SEARCH_ON_TRACKERS=⚠️ 以下站点搜索失败：
+HOWTO_DOWNLOAD_MAGNET_LINK=⚠️ 复制下面的磁力链接到下载器
+ALL_STOPPED=⏹ 已暂停全部任务
+ALL_STARTED=⏩ 已启动全部任务
+UNSUPPORTED_MIME_TYPE=不支持这种消息类型
+MESSAGE_IS_TOO_LONG=关键词太长，请精简到 256 字以内。
+status.downloading=下载中
+status.seeding=做种中
+status.stopped=已暂停
+status.checking=校验中
+status.check_pending=等待校验
+status.download_pending=等待下载
+status.seed_pending=等待做种
+BATCH_FOUND=🔗 识别到 {} 条磁力链接：
+BATCH_ITEM_UNKNOWN={}. 未命名任务（{}…），获取到种子信息后自动分类
+BATCH_MANUAL=按所选目录
+BATCH_MORE=…以及另外 {} 条
+BATCH_NAME_HINT=💡 部分链接没有 dn 名称参数，会在拿到种子信息后自动归类。
+BATCH_CHOOSE=请选择保存方式：点「🤖 自动分类」按名称分目录，或直接指定目录。
+BATCH_ADDING=正在添加 {}/{} …
+BATCH_RESULT=✅ 已添加 {} / {} 个任务
+BATCH_DUPLICATES=⏭ 跳过 {} 个已存在的任务：{}
+BATCH_FAILED=❌ 添加失败 {} 个：
+BATCH_TIPS=进度会实时更新，完成后会推送通知。
+AUTO_CLASSIFY_ON=🤖 已按名称自动分类。想固定目录的话，重新发送并手动选择即可。
+CARD_TITLE=🎬 <b>{}</b>
+CARD_STATUS=📌 状态：{}
+CARD_DIR_INLINE=📁 <code>{}</code>
+CARD_METADATA=📡 正在获取种子元数据…
+CARD_PROGRESS=📊 {} {}
+CARD_SIZE=💾 {} / {}
+CARD_SPEED=⚡ ↓ {} ｜ ↑ {}
+CARD_PEERS=👥 连接 {} ｜ 🌱 分享率 {}
+CARD_ETA=⏳ 剩余 {}
+DONE_TITLE=✅ <b>下载完成</b>
+DONE_DIR=📁 {}
+DONE_SIZE=💾 {}
+DONE_SPEED=⏱ 用时 {} ｜ ⚡ 平均 {}
+DONE_RATIO=🌱 分享率 {}
+BTN_DETAILS=ℹ️ 详情
+BTN_DEL_KEEP=🗑 仅删种子
+BTN_DEL_DATA=🗑 连文件一起删
+MILESTONE=📈 《{}》进度已达 {}％
+STALLED=⚠️ 《{}》已 {} 分钟没有进度（停在 {}，当前速度 {}），请检查 Tracker 或做种情况。
+TORRENT_ERROR=❌ 《{}》出错：{}
+PAUSED_ON_COMPLETE=⏸ 已按配置在完成后暂停做种。
+CLASSIFIED=📂 《{}》已自动归类到 <code>{}</code>（规则：{}）
+CLASSIFY_FAILED=⚠️ 《{}》自动归类失败：{}
+STATUS_TITLE=📊 <b>Transmission 状态</b>
+STATUS_TASKS=🗂 任务：{} 个（下载 {} ｜ 做种 {} ｜ 暂停 {}）
+STATUS_SPEED=⚡ 当前速度：↓ {} ｜ ↑ {}
+STATUS_SESSION=📥 本次会话：下载 {} ｜ 上传 {}
+STATUS_TOTAL=📦 累计流量：下载 {} ｜ 上传 {}
+STATUS_LIMIT=🚦 全局限速：↓ {} ｜ ↑ {}
+STATUS_DISK=💽 磁盘剩余：
+STATUS_FREE=剩余 {}
+SPEED_USAGE=用法：/speed 5M 1M（下载 上传，单位 KB/s，支持 K/M/G）
+            /speed off 取消限速
+            当前：{}
+SPEED_OFF=🚦 已取消全局限速
+SPEED_SET=🚦 已设置全局限速：↓ {} ｜ ↑ {}
+SPEED_CURRENT=↓ {} ｜ ↑ {}
+SPEED_UNLIMITED=不限速
+RULES_TITLE=🏷 <b>自动分类规则</b>（按顺序匹配，先命中者生效）
+RULES_HINT=修改规则：编辑 config/torrentino.yaml 的 auto_classify 段，保存后无需重启。
+           测试分类：/classify 任务名称
+CLASSIFY_USAGE=用法：/classify SSIS-123 或 /classify FC2-PPV-1234567
+CLASSIFY_RESULT=🔍 名称：{}
+               🏷 分类：<b>{}</b>
+               📌 命中规则：{}（{}）
+               📁 目标目录：<code>{}</code>
+[zh-hant]
+WELCOME_NEW_USER=歡迎 {}！你已獲得使用權限。
+ACCESS_RESTRICTED=你沒有使用權限，請聯繫管理員開通。
+TORRENT_REMOVED=🗑 任務已刪除：{}
+TORRENT_REMOVED_WITH_DATA=🗑 已刪除任務並清理檔案：{}
+TORRENT_REMOVED_KEEP_DATA=🗑 已刪除任務，檔案已保留：{}
+HELP=用底部按鈕或指令管理 Transmission：
+     • 直接傳送磁力連結（可一次多條）或 .torrent 檔案即可開始下載
+     • /torrents 任務列表 ｜ /status 伺服器狀態 ｜ /history 下載歷史
+     • /rules 分類規則 ｜ /classify 測試分類 ｜ /speed 全局限速
+     傳送關鍵字即可搜尋支援的站點。
+HELP_ADMIN=管理員指令：
+           /adduser 產生邀請連結（15 分鐘內有效，一次性）
+DOING_SEARCH=正在搜尋：
+NAV_HEADER=🔎 搜尋結果：第 {} / {} 頁（共 {} 條）
+           -------------------------
+NO_SEARCH_RESULTS=還沒有搜尋記錄。直接傳送關鍵字試試，例如：流浪地球
+NOTHING_FOUND=沒有找到相關結果。
+CHOOSE_DOWNLOAD_DIR=請選擇《{}》的儲存目錄：
+ADDING_TORRENT_FILE_IS_CORRUPTED=❌ 檔案損壞，或連結不是種子檔案。
+ADDING_FILE_SOMETHING_WENT_WRONG=❌ 新增失敗
+SOMETHING_WENT_WRONG=出錯了
+DOWNLOAD_COMPLETED=下載完成：{}
+TORRENT_INFO_PAGE_HEADER=第 {} / {} 頁（共 {} 個檔案）
+TORRENT_LIST_HEADER=📁 任務列表：第 {} / {} 頁（共 {} 個任務）
+DOWNLOAD_HISTORY_NAV=🕑 下載歷史：第 {} / {} 頁（共 {} 條）
+                    ---------------------
+PROGRESS_STATUS=進度 {0} ｜ 狀態 {1}
+BAD_PAGE_ACCESS=頁面已失效，請重新傳送 /torrents 或重新搜尋。
+FAILED_INIT_TRACKERS=⚠️ 以下站點初始化失敗：
+FAILED_SEARCH_ON_TRACKERS=⚠️ 以下站點搜尋失敗：
+HOWTO_DOWNLOAD_MAGNET_LINK=⚠️ 複製下面的磁力連結到下載器
+ALL_STOPPED=⏹ 已暫停全部任務
+ALL_STARTED=⏩ 已啟動全部任務
+UNSUPPORTED_MIME_TYPE=不支援這種訊息類型
+MESSAGE_IS_TOO_LONG=關鍵字太長，請精簡到 256 字以內。
+status.downloading=下載中
+status.seeding=做種中
+status.stopped=已暫停
+status.checking=校驗中
+status.check_pending=等待校驗
+status.download_pending=等待下載
+status.seed_pending=等待做種
+BATCH_FOUND=🔗 識別到 {} 條磁力連結：
+BATCH_CHOOSE=請選擇儲存方式：點「🤖 自動分類」按名稱分目錄，或直接指定目錄。
+BATCH_RESULT=✅ 已新增 {} / {} 個任務
+BATCH_TIPS=進度會即時更新，完成後會推送通知。
+CARD_TITLE=🎬 <b>{}</b>
+CARD_STATUS=📌 狀態：{}
+CARD_METADATA=📡 正在取得種子中繼資料…
+CARD_PROGRESS=📊 {} {}
+CARD_SIZE=💾 {} / {}
+CARD_SPEED=⚡ ↓ {} ｜ ↑ {}
+CARD_PEERS=👥 連線 {} ｜ 🌱 分享率 {}
+CARD_ETA=⏳ 剩餘 {}
+DONE_TITLE=✅ <b>下載完成</b>
+DONE_DIR=📁 {}
+DONE_SIZE=💾 {}
+DONE_SPEED=⏱ 耗時 {} ｜ ⚡ 平均 {}
+DONE_RATIO=🌱 分享率 {}
+BTN_DETAILS=ℹ️ 詳情
+BTN_DEL_KEEP=🗑 僅刪種子
+BTN_DEL_DATA=🗑 連檔案一起刪
+STATUS_TITLE=📊 <b>Transmission 狀態</b>
+STATUS_TASKS=🗂 任務：{} 個（下載 {} ｜ 做種 {} ｜ 暫停 {}）
+STATUS_SPEED=⚡ 目前速度：↓ {} ｜ ↑ {}
+STATUS_SESSION=📥 本次工作階段：下載 {} ｜ 上傳 {}
+STATUS_TOTAL=📦 累計流量：下載 {} ｜ 上傳 {}
+STATUS_DISK=💽 磁碟剩餘：
+STATUS_FREE=剩餘 {}
+SPEED_OFF=🚦 已取消全局限速
+SPEED_SET=🚦 已設定全局限速：↓ {} ｜ ↑ {}
+SPEED_UNLIMITED=不限速
+RULES_TITLE=🏷 <b>自動分類規則</b>（依序匹配，先命中者生效）
+CLASSIFY_USAGE=用法：/classify SSIS-123
+CLASSIFY_RESULT=🔍 名稱：{}
+               🏷 分類：<b>{}</b>
+               📌 命中規則：{}（{}）
+               📁 目標目錄：<code>{}</code>
+[ru]
+ACCESS_RESTRICTED=У вас недостаточно прав для выполнения этой команды. Пожалуйста обратитесь к администратору.
+TORRENT_LIST_HEADER=Список торрентов: страница {} из {} ({} файлов):
+ADDING_TORRENT_FILE_WILL_BE_DOWNLOADED=Файл будет загружен в папку {}
+ADDING_TORRENT_FILE_IS_CORRUPTED=Файл поврежден или ссылка не содержит торрент-файл. Возможна одна из проблем:
+                                 - торрент трекер требует авторизацию
+                                 - сайт или файл не доступен
+                                 - поврежденный или неправильный файл
+ADDING_FILE_SOMETHING_WENT_WRONG=Что то пошло не так
+TORRENT_REMOVED=Торрент {0} был удалён с Transmission сервера
+HELP=Используйте клавиатуру для управления торрентами
+     - "📁 Torrents", список торрентов на вашем сервере
+     - "🔍 Search", результаты последнего поиска
+HELP_ADMIN=Доступны команды администратора:
+           /adduser, выдать токен для нового пользователя
+DOING_SEARCH=Подождите, ищу:
+NAV_HEADER=Поиск: страница {} из {} ({} постов):
+           -------------------------
+NO_SEARCH_RESULTS=Похоже вы ещё не пользовались поиском сегодня. Попробуйте что нибудь найти, например: С лёгким паром
+NOTHING_FOUND=К сожалению по вашему запросу ничего не найдено.
+CHOOSE_DOWNLOAD_DIR=Выберите папку для загрузки файла "{}":
+DOWNLOAD_COMPLETED=Загрузка {} завершена
+TORRENT_INFO_PAGE_HEADER=страница {} из {} ({} файлов)
+PROGRESS_STATUS=завершено: {0}, статус: {1}
+BAD_PAGE_ACCESS=Страница не найдена, используйте меню бота для навигации, или попробуйте повторить поиск
+FAILED_INIT_TRACKERS=Проверьте логи и конфигурацию. Не удалось инициализировать трекеры:
+FAILED_SEARCH_ON_TRACKERS=Ошибка поиска на трекерах:
+HOWTO_DOWNLOAD_MAGNET_LINK=Скопируйте ссылку в торрент-клиент
+[uk]
+WELCOME_SUPER_USER=Вітаю, твій акаунт додано супер-користувачем цього боту
+ACCESS_RESTRICTED=У вас недостатньо дозволів для виконання цієї команди. Будь-ласка зверніться до адміністратора.
+TORRENT_LIST_HEADER=Список торрентів: сторінка {} з {} (всього {} файлів):
+ADDING_TORRENT_FILE_WILL_BE_DOWNLOADED=Файл буде завантажено в папку {}. Я повідомлю вас щойно завершиться завантажання.
+ADDING_TORRENT_FILE_IS_CORRUPTED=Файл пошкоджено або посилання не містить торрент-файл. Можлива одна із проблем:
+                                 - торрент трекер вимагає авторизацію
+                                 - сайт або файл не доступний
+                                 - пошкоджений чи неправильний файл
+ADDING_FILE_SOMETHING_WENT_WRONG=Щось пішло не так
+TORRENT_REMOVED=Торрент {} видалено з Transmission серверу
+HELP=Використовуйте клавіатуру для управління торентами.
+     Доступні команди:
+     - "📁 Torrents", переглянути статус торентів
+     - "🔍 Search", результати останнього пошуку
+HELP_ADMIN=Команди для адміністрування:
+           /adduser, issue auth token for new user
+DOING_SEARCH=Зачекайте, шукаю:
+NAV_HEADER=Пошук: сторінка {} з {} ({} постів):
+           -------------------------
+DOWNLOAD_HISTORY_NAV=Журнал: сторінка {} з {} ({} постів)
+                    -------------------------
+NO_SEARCH_RESULTS=Схоже ви ще не користувалися пошуком сьогодні. Спробуйте щось знайти, наприклад: Дизель шоу.
+NOTHING_FOUND=Нажаль за вашим запитом нічого не знайдено.
+CHOOSE_DOWNLOAD_DIR=Оберіть папку для завантажання файлу "{}":
+DOWNLOAD_COMPLETED=Заватаження {} завершено
+TORRENT_INFO_PAGE_HEADER=сторінка {} з {} ({} файлів)
+PROGRESS_STATUS=завершено: {0}, статус: {1}
+status.seeding=Роздається
+status.downloading=Завантаження
+status.stopped=Зупинено
+UNSUPPORTED_MIME_TYPE=Формат файлу не підтримується
+MESSAGE_IS_TOO_LONG=Занадто довга фраза для пошуку, спробуйте щось коротше, наприклад "Дизель шоу"
+BAD_PAGE_ACCESS=Сторінку не знайдено, використайте меню бота для навігації, або спробуйте повторити пошук
+FAILED_INIT_TRACKERS=Перевірте логи та конфігурацію. Не вдалось ініціалізувати трекери:
+FAILED_SEARCH_ON_TRACKERS=Помилка пошуку на трекерах:
+HOWTO_DOWNLOAD_MAGNET_LINK=Додайте посилання в ваш торент клієнт

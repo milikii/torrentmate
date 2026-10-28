@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transmission Telegram Bot · 汉化效果预览</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#151a21; --line:#232b36;
+    --text:#e8edf4; --muted:#8b98a9;
+    --bubble:#1f2a38; --bubble-me:#2b5278;
+    --accent:#4ea1ff; --green:#54d18c; --red:#ff6b6b; --amber:#f2b544;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:radial-gradient(1200px 600px at 50% -10%,#1b2533 0%,var(--bg) 55%);
+    color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:40px 20px 80px;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  header{text-align:center;margin-bottom:36px}
+  h1{font-size:26px;margin:0 0 10px;letter-spacing:.5px}
+  header p{color:var(--muted);margin:0;font-size:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:22px}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden;
+    box-shadow:0 12px 30px rgba(0,0,0,.35);display:flex;flex-direction:column;
+  }
+  .card h2{
+    font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.6px;
+    margin:0;padding:14px 16px;border-bottom:1px solid var(--line);text-transform:uppercase;
+  }
+  .chat{padding:16px;display:flex;flex-direction:column;gap:10px;flex:1}
+  .msg{max-width:100%;padding:10px 12px;border-radius:12px;font-size:13.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+  .bot{background:var(--bubble);border:1px solid #283442;align-self:flex-start;border-radius:12px 12px 12px 4px}
+  .me{background:var(--bubble-me);align-self:flex-end;border-radius:12px 12px 4px 12px}
+  .name{font-weight:600;color:#fff;margin-bottom:2px;display:block;word-break:break-all}
+  .dim{color:var(--muted)}
+  .bar{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-1px;color:var(--accent)}
+  .ok{color:var(--green)} .warn{color:var(--amber)} .err{color:var(--red)}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;padding:0 16px 16px}
+  .btn{
+    background:#1c2836;border:1px solid #2c3a4b;color:#cfe3ff;border-radius:10px;
+    padding:8px 12px;font-size:12.5px;white-space:nowrap;
+  }
+  .btn.primary{background:#203a56;border-color:#2f5580;color:#dcecff}
+  .btn.danger{color:#ffb3b3;border-color:#4a2b2b;background:#2a1c1c}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11.5px;border:1px solid #2d3b4c;color:#9fb4cc}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d141c;border:1px solid #243040;border-radius:5px;padding:1px 5px;font-size:12px;color:#9fd0ff}
+  footer{max-width:1080px;margin:34px auto 0;color:var(--muted);font-size:12.5px;text-align:center;line-height:1.8}
+  .legend{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin-top:14px;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Transmission Telegram Bot · 汉化效果预览</h1>
+    <p>静态还原实际推送文案与按钮布局（数据为示例，仅用于预览，不连接任何服务）</p>
+  </header>
+
+  <div class="grid">
+
+    <section class="card">
+      <h2>① 一条消息里 3 条磁力链接</h2>
+      <div class="chat">
+        <div class="msg me">这几部一起下
+magnet:?xt=urn:btih:9f2c…&amp;dn=FC2-PPV-1234567
+magnet:?xt=urn:btih:4ab1…&amp;dn=SSIS-123
+magnet:?xt=urn:btih:77de…&amp;dn=麻豆MD-0123</div>
+        <div class="msg bot">🔗 识别到 <b>3</b> 条磁力链接：
+
+1. FC2-PPV-1234567 → <b>FC2</b>
+2. SSIS-123 → <b>有码</b>
+3. 麻豆MD-0123 → <b>国产</b>
+
+请选择保存方式：点「🤖 自动分类」按名称分目录，或直接指定目录。</div>
+      </div>
+      <div class="btns">
+        <span class="btn primary">🤖 自动分类</span>
+        <span class="btn">FC2</span>
+        <span class="btn">有码</span>
+        <span class="btn">无码</span>
+        <span class="btn">国产</span>
+        <span class="btn">未分类</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>② 进度卡片（原地刷新）</h2>
+      <div class="chat">
+        <div class="msg bot"><span class="name">🎬 FC2-PPV-1234567</span>📌 状态：下载中 ｜ 📁 <code>/downloads/FC2</code>
+📊 <span class="bar">███████░░░</span> 68.4%
+💾 3.12GB / 4.56GB
+⚡ ↓ 6.31MB/s ｜ ↑ 210.5KB/s
+👥 连接 24 ｜ 🌱 分享率 0.08
+⏳ 剩余 03:12</div>
+        <div class="msg me">再加一条</div>
+      </div>
+      <div class="btns">
+        <span class="tag">同一张卡片每 45 秒刷新</span>
+        <span class="tag">进度变化 ≥5% 立即刷新</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>③ 完成通知 + 一键清理</h2>
+      <div class="chat">
+        <div class="msg bot"><span class="ok"><b>✅ 下载完成</b></span>
+🎬 FC2-PPV-1234567
+📁 /downloads/FC2
+💾 4.56GB
+⏱ 用时 00:26:41 ｜ ⚡ 平均 2.91MB/s
+🌱 分享率 0.00</div>
+      </div>
+      <div class="btns">
+        <span class="btn">ℹ️ 详情</span>
+        <span class="btn">🗑 仅删种子</span>
+        <span class="btn danger">🗑 连文件一起删</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>④ /status 服务器与磁盘</h2>
+      <div class="chat">
+        <div class="msg me">/status</div>
+        <div class="msg bot"><b>📊 Transmission 状态</b>
+🗂 任务：5 个（下载 2 ｜ 做种 1 ｜ 暂停 2）
+⚡ 当前速度：↓ 7.82MB/s ｜ ↑ 1.24MB/s
+📥 本次会话：下载 18.4GB ｜ 上传 6.1GB
+📦 累计流量：下载 2.13TB ｜ 上传 804.2GB
+
+💽 磁盘剩余：
+  • FC2  <code>/downloads/FC2</code>  剩余 312.5GB
+  • 有码  <code>/downloads/有码</code>  剩余 312.5GB
+  • 国产  <code>/downloads/国产</code>  剩余 312.5GB
+  • 未分类  <code>/downloads/未分类</code>  剩余 312.5GB</div>
+      </div>
+      <div class="btns"><span class="tag">一次看清队列、速度、空间</span></div>
+    </section>
+
+    <section class="card">
+      <h2>⑤ /classify 调试分类规则</h2>
+      <div class="chat">
+        <div class="msg me">/classify hhd800.com@IPX-999.mp4</div>
+        <div class="msg bot">🔍 名称：hhd800.com@IPX-999.mp4
+🏷 分类：<b>有码</b>
+📌 命中规则：有码（IPX-999）
+📁 目标目录：<code>/downloads/有码</code></div>
+        <div class="msg me">/classify The.Office.US.S01E01.1080p</div>
+        <div class="msg bot">🔍 名称：The.Office.US.S01E01.1080p
+🏷 分类：<b>未分类</b>
+📌 命中规则：fallback（-）
+📁 目标目录：<code>/downloads/未分类</code></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>⑥ 无名称磁力的二次归类</h2>
+      <div class="chat">
+        <div class="msg bot">📡 正在获取种子元数据…</div>
+        <div class="msg bot">📂 《FC2-PPV-7654321》已自动归类到 <code>/downloads/FC2</code>（规则：fc2）</div>
+        <div class="msg bot"><span class="warn">⚠️ 《SSIS-999》已 31 分钟没有进度（停在 42.0%，当前速度 0B/s），请检查 Tracker 或做种情况。</span></div>
+      </div>
+      <div class="btns">
+        <span class="tag">元数据到达后移动，不重新下载</span>
+        <span class="tag">停滞提醒默认 30 分钟</span>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="legend">
+    <span>🤖 自动分类</span><span>🎬 进度卡片</span><span>✅ 完成卡片</span><span>📊 状态</span><span>🏷 规则调试</span>
+  </div>
+
+  <footer>
+    预览文件：preview.html ｜ 实际配色与字号由 Telegram 客户端决定<br>
+    代码仓库：transmission-telegram-bot（分支 zh-custom）· 测试 49 项通过 · flake8 / mypy 无告警
+  </footer>
+</div>
+</body>
+</html>
