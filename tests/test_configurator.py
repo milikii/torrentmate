@@ -48,3 +48,39 @@ def test_runtime_secrets_are_not_persisted(tmp_path: Path):
     finally:
         BotConfigurator.config_file = original_file
         BotConfigurator._runtime_overrides = original_overrides
+
+
+def test_add_user_does_not_persist_runtime_secret(tmp_path):
+    config_file = tmp_path / "torrentino.yaml"
+    config_file.write_text("bot: {}\n", encoding="utf-8")
+    original_file = BotConfigurator.config_file
+    original_overrides = BotConfigurator._runtime_overrides
+    try:
+        BotConfigurator.config_file = str(config_file)
+        BotConfigurator._runtime_overrides = {"bot.token": "runtime-secret"}
+        configurator = BotConfigurator()
+        configurator.add_user(42)
+        stored = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        assert 42 in stored["bot"]["allowed_users"]
+        assert "runtime-secret" not in config_file.read_text(encoding="utf-8")
+    finally:
+        BotConfigurator.config_file = original_file
+        BotConfigurator._runtime_overrides = original_overrides
+
+
+def test_config_reloads_after_other_instance_saves(tmp_path):
+    config_file = tmp_path / "torrentino.yaml"
+    config_file.write_text(
+        yaml.safe_dump({"bot": {"token": "token", "super_user": 7, "allowed_users": []}}),
+        encoding="utf-8",
+    )
+    original_file = BotConfigurator.config_file
+    try:
+        BotConfigurator.config_file = str(config_file)
+        first = BotConfigurator()
+        second = BotConfigurator()
+        assert second.get("bot.allowed_users") == []
+        first.add_user(42)
+        assert 42 in second.get("bot.allowed_users")
+    finally:
+        BotConfigurator.config_file = original_file

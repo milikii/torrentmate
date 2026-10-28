@@ -20,6 +20,12 @@ def restricted(func):
     ):
         user_id = update.effective_user.id
         super_user = bot_config.get("bot.super_user")
+        # YAML 里 super_user 可能被写成字符串，int 与 str 直接比较永远
+        # 不相等，超级用户会被自己挡在门外。
+        try:
+            super_user = int(super_user) if super_user is not None else None
+        except (TypeError, ValueError):
+            pass
         if not super_user:
             log.critical("Access denied because bot.super_user is not configured")
             await context.bot.send_message(
@@ -28,7 +34,10 @@ def restricted(func):
             )
             return
         # Check if user is allowed
-        is_allowed_user = user_id in _.get(bot_config.config, "bot.allowed_users", [])
+        allowed_users = _.get(bot_config.config, "bot.allowed_users", []) or []
+        is_allowed_user = user_id in allowed_users or str(user_id) in [
+            str(x) for x in allowed_users
+        ]
         if not is_allowed_user and user_id != super_user:
             log.debug(update)
 

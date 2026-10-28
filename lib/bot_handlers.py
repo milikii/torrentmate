@@ -984,7 +984,9 @@ async def welcomeNewUser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HANDLERS = [
     # 新用户邀请链接
-    MessageHandler(Regex(r"^/start\ welcome_[A-Za-z0-9]+$"), welcomeNewUser),
+    # token_urlsafe 会生成 - 和 _，旧正则只收字母数字，带这两种字符的
+    # 邀请链接永远匹配不上。
+    MessageHandler(Regex(r"^/start\ welcome_[A-Za-z0-9_-]+$"), welcomeNewUser),
     # 一条消息里可能有多条磁力链接，优先处理
     MessageHandler(MagnetMessageFilter(), batchMagnets),
     # 命令

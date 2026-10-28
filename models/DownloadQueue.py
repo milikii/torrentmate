@@ -24,6 +24,9 @@ class QueueEntry:
     lang_code: str | None = None
     title: str = ""
     requested_dir: str = ""
+    # 持久化时保存 info_hash，重启后按旧数字 ID 查到的任务若 hash 不符
+    # 说明 ID 已被别的任务复用，必须停止对它做移动/完成等自动操作。
+    info_hash: str | None = None
     auto_classify: bool = False
     message_id: int | None = None
     # 批量添加时，任务过多就不为每个任务单独发进度卡片
@@ -89,16 +92,20 @@ class DownloadQueue:
     def _save(cls) -> None:
         if not cls._state_file:
             return
-        try:
-            os.makedirs(os.path.dirname(cls._state_file) or ".", exist_ok=True)
-            tmp = f"{cls._state_file}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(
-                    [e.to_json() for e in cls._items.values()], f, ensure_ascii=False
-                )
-            os.replace(tmp, cls._state_file)
-        except Exception as err:  # noqa: BLE001
-            log.warning("保存下载队列失败: %s", err)
+        # 落盘必须在同一把锁内完成快照和写入：之前先放锁再调 _save，
+        # 监控协程和工作线程可能同时遍历/写同一个 .tmp 文件互相截断。
+        with cls._lock:
+            items = [e.to_json() for e in cls._items.values()]
+            try:
+                os.makedirs(os.path.dirname(cls._state_file) or ".", exist_ok=True)
+                tmp = f"{cls._state_file}.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(items, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, cls._state_file)
+            except Exception as err:  # noqa: BLE001
+                log.warning("保存下载队列失败: %s", err)
 
     @classmethod
     def add(cls, entry: QueueEntry) -> None:
@@ -121,12 +128,25 @@ class DownloadQueue:
 
     @classmethod
     def snapshot(cls) -> dict[int, QueueEntry]:
+        # 返回深一点的副本：调用方改 entry 字段时不再直接改动内存里的
+        # 原条目，改完必须显式 update() 才生效；同时避免旧快照在条目
+        # 已被删除后又 update() 把它复活。
+        import copy
+
         with cls._lock:
-            return dict(cls._items)
+            result = {}
+            for k, v in cls._items.items():
+                entry = copy.copy(v)
+                entry.milestones_sent = set(v.milestones_sent)
+                result[k] = entry
+            return result
 
     @classmethod
     def update(cls, entry: QueueEntry) -> None:
         with cls._lock:
+            if entry.torrent_id not in cls._items:
+                # 条目已在别处被删除（完成/不存在），不要把它复活回来。
+                return
             cls._items[entry.torrent_id] = entry
         cls._save()
 

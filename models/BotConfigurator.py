@@ -1,3 +1,4 @@
+import copy
 import os
 import yaml
 import sys
@@ -32,6 +33,10 @@ class BotConfigurator:
             raise ValueError("BotConfigurator.config_file not set")
         self.commands = None
         self._config = None
+        # 磁盘原始配置（未注入环境变量/命令行运行时值），写盘时以它为底，
+        # 避免运行时 token、RPC 密码被写回 YAML。
+        self._disk_config = None
+        self._config_mtime: float | None = None
 
     @staticmethod
     def argparser():
@@ -137,9 +142,17 @@ class BotConfigurator:
         """
         Return configuration file as dict:
         - if file doesn't exist, create new file from template
+        - 配置文件被别的 BotConfigurator 实例改写（如 add_user）后，
+          下一次访问会按 mtime 重新加载，而不是一直用旧缓存，
+          否则邀请新用户后鉴权模块仍不认他。
         """
-        if self._config:
-            return self._config
+        if self._config is not None:
+            try:
+                current_mtime = os.path.getmtime(BotConfigurator.config_file)
+            except OSError:
+                current_mtime = None
+            if current_mtime == self._config_mtime:
+                return self._config
         if not os.path.exists(BotConfigurator.config_file):
             log.info("Configuration file %s not found", BotConfigurator.config_file)
             try:
@@ -161,12 +174,19 @@ class BotConfigurator:
                 sys.exit(1)
         with open(BotConfigurator.config_file, "r", encoding="utf-8") as config_file:
             self._config = yaml.safe_load(config_file) or {}
+        self._disk_config = copy.deepcopy(self._config)
+        try:
+            self._config_mtime = os.path.getmtime(BotConfigurator.config_file)
+        except OSError:
+            self._config_mtime = None
         self.init_args()
 
         return self._config
 
     def set(self, path: str, value: str) -> None:
-        if not (value and value != _.get(self.config, path)):
+        # 之前用 `not value` 判断，False、0、空字符串都写不进去，
+        # 例如把开关关掉就永远改不动。
+        if value is None or value == _.get(self.config, path):
             return
         _.set_(self._config, path, value)
         if path in {"bot.token", "transmission.password"} or path.endswith("password"):
@@ -178,10 +198,58 @@ class BotConfigurator:
     def get(self, path: str | list[str], default: Any = None) -> Any:
         return _.get(self.config, path, default)
 
+    def _persistable_config(self) -> Dict:
+        """可写盘的配置：以磁盘原始配置为底，只合并不属于运行时注入
+        的改动（如 allowed_users、label），运行时注入的 token、RPC 密码
+        等一律不写回，写回时置为 None，避免旧密钥残留误导。"""
+        if self._config is None:
+            _ = self.config
+        disk = copy.deepcopy(self._disk_config or {})
+        runtime = BotConfigurator._runtime_overrides or {}
+
+        def _merge(dst: Dict, src: Dict, prefix: str = "") -> None:
+            for key, value in src.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if path in runtime and runtime[path] is not None:
+                    continue
+                if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                    _merge(dst[key], value, path)
+                else:
+                    dst[key] = copy.deepcopy(value)
+
+        _merge(disk, self._config or {})
+        for path, value in runtime.items():
+            if value is not None:
+                try:
+                    _.set_(disk, path, None)
+                except Exception:  # noqa: BLE001
+                    pass
+        return disk
+
     def save_config(self) -> None:
         log.info("Updating configuration file: %s", self.config_file)
-        with open(self.config_file, "w", encoding="utf-8") as f:
-            yaml.safe_dump(self._config, f, sort_keys=False, allow_unicode=True)
+        data = self._persistable_config()
+        directory = os.path.dirname(self.config_file) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = f"{self.config_file}.tmp"
+        try:
+            mode = os.stat(self.config_file).st_mode & 0o777 if os.path.exists(
+                self.config_file
+            ) else 0o600
+        except OSError:
+            mode = 0o600
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        # 原子替换：中途崩溃也不会把配置文件写成半截。
+        os.replace(tmp, self.config_file)
+        self._disk_config = copy.deepcopy(data)
+        try:
+            self._config_mtime = os.path.getmtime(self.config_file)
+        except OSError:
+            self._config_mtime = None
 
     def validate(self) -> bool:
         failed_checks = []
@@ -268,8 +336,12 @@ class BotConfigurator:
         return self
 
     def add_user(self, user_id: int) -> "BotConfigurator":
-        if user_id not in self.config["bot"]["allowed_users"]:
+        cfg = self.config
+        bot_section = cfg.setdefault("bot", {})
+        allowed = bot_section.get("allowed_users") or []
+        bot_section["allowed_users"] = allowed
+        if user_id not in allowed and str(user_id) not in [str(x) for x in allowed]:
             log.info("Adding user_id %s to allowed users", user_id)
-            self._config["bot"]["allowed_users"].append(user_id)
+            allowed.append(user_id)
             self.save_config()
         return self

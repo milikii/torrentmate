@@ -224,3 +224,80 @@ async def test_stalled_notification(env):
     await DownloadMonitor(FakeClient(torrent), bot).tick()
 
     assert any("没有进度" in message["text"] for message in bot.sent)
+
+
+class FailingBot(FakeBot):
+    async def send_message(self, **kwargs):
+        raise Exception("telegram down")
+
+    async def edit_message_text(self, **kwargs):
+        raise Exception("telegram down")
+
+
+async def test_classify_failure_retries_next_tick(env):
+    torrent = FakeTorrent(name="FC2-PPV-1234567", download_dir="/downloads/未分类")
+
+    class FailingMoveClient(FakeClient):
+        def change_torrent(self, torrent_id, location=None, **kwargs):
+            raise RuntimeError("disk full")
+
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/未分类",
+            auto_classify=True,
+        )
+    )
+    await DownloadMonitor(FailingMoveClient(torrent), FakeBot()).tick()
+    entry = DownloadQueue.get(1)
+    assert entry is not None and entry.classified is False
+
+    # 移动恢复后，下一轮应能成功归类。
+    await DownloadMonitor(FakeClient(torrent), FakeBot()).tick()
+    entry = DownloadQueue.get(1)
+    assert entry is not None and entry.classified is True
+    assert entry.final_dir == "/downloads/FC2"
+
+
+async def test_completion_failure_keeps_queue_and_history(env, tmp_path):
+    torrent = FakeTorrent(
+        name="SSIS-123",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/有码",
+        done_date=dt.datetime(2026, 10, 28, 12, 0, 0),
+        added_date=dt.datetime(2026, 10, 28, 11, 50, 0),
+    )
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=555,
+        )
+    )
+    await DownloadMonitor(FakeClient(torrent), FailingBot()).tick()
+    assert DownloadQueue.get(1) is not None
+    assert not (tmp_path / "history.jsonl").exists()
+
+
+async def test_hash_mismatch_does_not_move_torrent(env):
+    torrent = FakeTorrent(name="FC2-PPV-1234567", download_dir="/downloads/未分类")
+    client = FakeClient(torrent)
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/未分类",
+            info_hash="deadbeef",
+            auto_classify=True,
+        )
+    )
+    await DownloadMonitor(client, FakeBot()).tick()
+    assert client.moved == []
+    assert DownloadQueue.get(1) is None

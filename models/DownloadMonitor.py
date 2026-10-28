@@ -77,23 +77,38 @@ class DownloadMonitor:
             except Exception as err:  # noqa: BLE001
                 log.warning("读取任务 %s 状态失败: %s", torrent_id, err)
                 continue
+            # 队列只存数字 ID，Transmission 重启/删种后 ID 可能被别的任务
+            # 复用：hash 对不上就停止对这个条目做一切自动操作，避免移错、
+            # 删错、通知错任务；旧条目（无 hash）不受影响。
+            entry_hash = (entry.info_hash or "").lower() or None
+            torrent_hash = str(getattr(torrent, "info_hash", "") or "").lower() or None
+            if entry_hash and torrent_hash and entry_hash != torrent_hash:
+                log.error(
+                    "任务 %s 的 info_hash 与队列记录不符（可能 ID 被复用），"
+                    "停止处理并移出队列",
+                    torrent_id,
+                )
+                DownloadQueue.remove(torrent_id)
+                continue
             try:
                 await self.handle(torrent, entry)
             except Exception as err:  # noqa: BLE001
                 log.exception("处理任务 %s 通知失败: %s", torrent_id, err)
 
     async def handle(self, torrent: Torrent, entry: QueueEntry) -> None:
-        # 1. 任务出错，只提醒一次
+        # 1. 任务出错，只提醒一次：先发送，确认送达才标记已通知，
+        # 否则发送失败也会被当成已通知，错误提醒就永久丢失了。
         if torrent.error_string and not entry.notified_error:
-            entry.notified_error = True
-            DownloadQueue.update(entry)
-            await self._send(
+            sent = await self._send(
                 entry,
                 trans("TORRENT_ERROR", entry.lang_code).format(
                     escape_html(torrent.name),
                     escape_html(torrent.error_string),
                 ),
             )
+            if sent is not None:
+                entry.notified_error = True
+                DownloadQueue.update(entry)
             return
 
         # 2. 磁力链接还在获取元数据
@@ -123,13 +138,13 @@ class DownloadMonitor:
         result = classifier.classify(torrent.name)
         target = classifier.resolve_path(result.directory) or entry.requested_dir
 
-        entry.classified = True
-        entry.final_dir = target or torrent.download_dir
-        DownloadQueue.update(entry)
-
         if not target or os.path.normpath(str(target)) == os.path.normpath(
             str(torrent.download_dir)
         ):
+            # 已在目标目录：标记已归类即可，不用再移动。
+            entry.classified = True
+            entry.final_dir = target or torrent.download_dir
+            DownloadQueue.update(entry)
             return
 
         try:
@@ -140,14 +155,9 @@ class DownloadMonitor:
                 await asyncio.to_thread(
                     self.client.move_torrent_data, torrent.id, target, move=True
                 )
-            log.info("任务 %s 自动归类到 %s", torrent.name, target)
-            await self._send(
-                entry,
-                trans("CLASSIFIED", entry.lang_code).format(
-                    escape_html(torrent.name), escape_html(target), result.rule
-                ),
-            )
         except Exception as err:  # noqa: BLE001
+            # 移动失败时不要标记 classified：下一轮还会重试，而不是
+            # 卡片显示目标目录、实际却永远没去成。
             log.error("任务 %s 自动归类失败: %s", torrent.name, err)
             await self._send(
                 entry,
@@ -155,16 +165,21 @@ class DownloadMonitor:
                     escape_html(torrent.name), escape_html(str(err))
                 ),
             )
+            return
 
-    async def _complete(self, torrent: Torrent, entry: QueueEntry) -> None:
-        entry.finished = True
-        DownloadHistory.add(
-            torrent.done_date,
-            torrent.name,
-            torrent.download_dir,
-            torrent.size_when_done,
+        # 只有移动成功后才标记已归类、写最终目录。
+        entry.classified = True
+        entry.final_dir = target
+        DownloadQueue.update(entry)
+        log.info("任务 %s 自动归类到 %s", torrent.name, target)
+        await self._send(
+            entry,
+            trans("CLASSIFIED", entry.lang_code).format(
+                escape_html(torrent.name), escape_html(target), result.rule
+            ),
         )
 
+    async def _complete(self, torrent: Torrent, entry: QueueEntry) -> None:
         elapsed = None
         try:
             if torrent.done_date and torrent.added_date:
@@ -176,6 +191,9 @@ class DownloadMonitor:
         keyboard = self._done_keyboard(torrent, entry.lang_code)
         log.info("下载完成: %s -> %s", torrent.name, torrent.download_dir)
 
+        # 先确认完成卡片真的送达，再写历史、清队列：之前是先标记
+        # finished、直接清队列，发送失败时完成通知就永久丢失了。
+        delivered = False
         if entry.message_id:
             try:
                 await self.bot.edit_message_text(
@@ -186,12 +204,24 @@ class DownloadMonitor:
                     reply_markup=keyboard,
                     disable_web_page_preview=True,
                 )
+                delivered = True
             except TelegramError as err:
                 log.debug("进度卡片更新失败，改为发送新消息: %s", err)
-                await self._send(entry, text, keyboard)
+                delivered = (await self._send(entry, text, keyboard)) is not None
         else:
-            await self._send(entry, text, keyboard)
+            delivered = (await self._send(entry, text, keyboard)) is not None
 
+        if not delivered:
+            log.warning("完成卡片发送失败，任务 %s 保留在队列中下轮重试", torrent.id)
+            return
+
+        entry.finished = True
+        DownloadHistory.add(
+            torrent.done_date,
+            torrent.name,
+            torrent.download_dir,
+            torrent.size_when_done,
+        )
         DownloadQueue.remove(torrent.id)
 
         if self.pause_on_complete and torrent.status == "seeding":
@@ -283,14 +313,15 @@ class DownloadMonitor:
             return
         for milestone in self.milestones:
             if percent >= milestone and milestone not in entry.milestones_sent:
-                entry.milestones_sent.add(milestone)
-                DownloadQueue.update(entry)
-                await self._send(
+                sent = await self._send(
                     entry,
                     trans("MILESTONE", entry.lang_code).format(
                         escape_html(torrent.name), milestone
                     ),
                 )
+                if sent is not None:
+                    entry.milestones_sent.add(milestone)
+                    DownloadQueue.update(entry)
 
     async def _check_stalled(self, torrent: Torrent, entry: QueueEntry) -> None:
         if not self.stalled_minutes:
@@ -306,10 +337,8 @@ class DownloadMonitor:
             return
         idle = time.time() - float(entry.last_progress_ts or time.time())
         if idle >= self.stalled_minutes * 60:
-            entry.notified_stalled = True
-            DownloadQueue.update(entry)
             speed = speed_to_human(torrent.rate_download)
-            await self._send(
+            sent = await self._send(
                 entry,
                 trans("STALLED", entry.lang_code).format(
                     escape_html(torrent.name),
@@ -318,6 +347,9 @@ class DownloadMonitor:
                     speed,
                 ),
             )
+            if sent is not None:
+                entry.notified_stalled = True
+                DownloadQueue.update(entry)
 
     async def _send(self, entry: QueueEntry, text: str, reply_markup: Any = None):
         try:

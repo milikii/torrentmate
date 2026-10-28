@@ -70,6 +70,8 @@ class TransmissionClient(Client):
                 lang_code=lang_code,
                 title=title or _torrent.name or "",
                 requested_dir=str(download_dir or ""),
+                info_hash=str(getattr(_torrent, "info_hash", "") or "").lower()
+                or None,
                 auto_classify=auto_classify,
                 message_id=message_id,
                 final_dir=str(download_dir) if download_dir else None,
