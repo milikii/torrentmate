@@ -111,13 +111,18 @@ class DownloadMonitor:
                 DownloadQueue.update(entry)
             return
 
-        # 2. 磁力链接还在获取元数据
-        if int(torrent.metadata_percent_complete or 0) < 100:
+        # 2. 磁力链接还在获取元数据：transmission_rpc 的
+        # metadata_percent_complete 范围是 0~1，不是 0~100，
+        # 之前按 <100 判断，真实任务永远提前返回，归类、完成、
+        # 停滞全不执行，进度卡片还每轮发新消息刷屏。
+        if float(torrent.metadata_percent_complete or 0) < 1:
             await self._update_card(torrent, entry, metadata=True)
             return
 
-        # 3. 自动归类（只执行一次）
-        await self._maybe_classify(torrent, entry)
+        # 3. 自动归类（只执行一次）：归类失败返回 False 时不进完成，
+        # 否则已完成但未归类的任务清了队列就永远没机会再移了。
+        if not await self._maybe_classify(torrent, entry):
+            return
 
         # 4. 下载完成
         if float(torrent.percent_done or 0) >= 1 and not entry.finished:
@@ -130,9 +135,9 @@ class DownloadMonitor:
         # 6. 长时间无进度提醒
         await self._check_stalled(torrent, entry)
 
-    async def _maybe_classify(self, torrent: Torrent, entry: QueueEntry) -> None:
+    async def _maybe_classify(self, torrent: Torrent, entry: QueueEntry) -> bool:
         if not entry.auto_classify or entry.classified:
-            return
+            return True
 
         classifier = get_classifier()
         result = classifier.classify(torrent.name)
@@ -145,7 +150,7 @@ class DownloadMonitor:
             entry.classified = True
             entry.final_dir = target or torrent.download_dir
             DownloadQueue.update(entry)
-            return
+            return True
 
         try:
             await asyncio.to_thread(
@@ -165,7 +170,7 @@ class DownloadMonitor:
                     escape_html(torrent.name), escape_html(str(err))
                 ),
             )
-            return
+            return False
 
         # 只有移动成功后才标记已归类、写最终目录。
         entry.classified = True
@@ -178,6 +183,7 @@ class DownloadMonitor:
                 escape_html(torrent.name), escape_html(target), result.rule
             ),
         )
+        return True
 
     async def _complete(self, torrent: Torrent, entry: QueueEntry) -> None:
         elapsed = None
@@ -213,6 +219,13 @@ class DownloadMonitor:
 
         if not delivered:
             log.warning("完成卡片发送失败，任务 %s 保留在队列中下轮重试", torrent.id)
+            # 通知失败也不能跳过暂停：否则任务会一直做种，
+            # 原来的 pause_on_complete 开关就失效了。
+            if self.pause_on_complete and torrent.status == "seeding":
+                try:
+                    await asyncio.to_thread(self.client.stop_torrent, torrent.id)
+                except Exception as err:  # noqa: BLE001
+                    log.warning("完成后暂停失败: %s", err)
             return
 
         entry.finished = True

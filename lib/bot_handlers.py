@@ -49,6 +49,16 @@ from models.TransmissionClient import TransmissionClient
 
 bot_config = BotConfigurator()
 
+
+def _super_user_id():
+    """超级用户 ID：YAML 里可能是字符串，直接与 int 比永远不相等。"""
+    value = bot_config.get("bot.super_user")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return value
+
+
 log = get_logger("main")
 
 _transmission_client = None
@@ -143,7 +153,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /help is issued."""
     lang_code = update.message.from_user.language_code
     HELP = trans("HELP", lang_code)
-    if update.message.chat.id == bot_config.get("bot.super_user"):
+    if update.message.chat.id == _super_user_id():
         HELP += "\n" + trans("HELP_ADMIN", lang_code)
     log.debug("%s, %s", update.message.chat.id, context.user_data)
     await context.bot.send_message(
@@ -946,7 +956,7 @@ async def classify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def addNewUser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.id == bot_config.get("bot.super_user"):
+    if update.message.chat.id == _super_user_id():
         hash = secrets.token_urlsafe(24)
         WELCOME_HASHES[hash] = time.monotonic() + WELCOME_LINK_TTL
         message = f"https://t.me/{context.bot.username}?start=welcome_{hash}"

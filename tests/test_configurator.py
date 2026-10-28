@@ -84,3 +84,27 @@ def test_config_reloads_after_other_instance_saves(tmp_path):
         assert 42 in second.get("bot.allowed_users")
     finally:
         BotConfigurator.config_file = original_file
+
+
+def test_add_user_does_not_leak_missing_section_runtime_secrets(tmp_path):
+    config_file = tmp_path / "torrentino.yaml"
+    config_file.write_text("bot: {}\n", encoding="utf-8")
+    original_file = BotConfigurator.config_file
+    original_overrides = BotConfigurator._runtime_overrides
+    try:
+        BotConfigurator.config_file = str(config_file)
+        BotConfigurator._runtime_overrides = {
+            "bot.token": "runtime-token",
+            "transmission.host": "tr-bt",
+            "transmission.password": "runtime-rpc-password",
+        }
+        BotConfigurator().add_user(42)
+        text = config_file.read_text(encoding="utf-8")
+        assert "runtime-token" not in text
+        assert "runtime-rpc-password" not in text
+        stored = yaml.safe_load(text)
+        assert 42 in stored["bot"]["allowed_users"]
+        assert (stored.get("transmission") or {}).get("password") in (None, "")
+    finally:
+        BotConfigurator.config_file = original_file
+        BotConfigurator._runtime_overrides = original_overrides

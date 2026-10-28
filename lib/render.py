@@ -45,7 +45,8 @@ def render_progress_card(
         )
     lines.append(head)
 
-    if torrent.metadata_percent_complete < 100:
+    # 与 DownloadMonitor 一致：范围是 0~1，不是 0~100。
+    if float(torrent.metadata_percent_complete or 0) < 1:
         lines.append(trans("CARD_METADATA", lang_code))
         return "\n".join(lines)
 

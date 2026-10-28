@@ -18,7 +18,7 @@ class FakeTorrent:
             "id": 1,
             "name": "SSIS-123",
             "download_dir": "/downloads/未分类",
-            "metadata_percent_complete": 100,
+            "metadata_percent_complete": 1,
             "percent_done": 0.4,
             "total_size": 1000,
             "left_until_done": 600,
@@ -226,12 +226,15 @@ async def test_stalled_notification(env):
     assert any("没有进度" in message["text"] for message in bot.sent)
 
 
+from telegram.error import TelegramError
+
+
 class FailingBot(FakeBot):
     async def send_message(self, **kwargs):
-        raise Exception("telegram down")
+        raise TelegramError("telegram down")
 
     async def edit_message_text(self, **kwargs):
-        raise Exception("telegram down")
+        raise TelegramError("telegram down")
 
 
 async def test_classify_failure_retries_next_tick(env):
@@ -301,3 +304,82 @@ async def test_hash_mismatch_does_not_move_torrent(env):
     await DownloadMonitor(client, FakeBot()).tick()
     assert client.moved == []
     assert DownloadQueue.get(1) is None
+
+
+async def test_metadata_incomplete_does_not_classify_or_complete(env):
+    torrent = FakeTorrent(
+        name="FC2-PPV-1234567",
+        download_dir="/downloads/未分类",
+        metadata_percent_complete=0.5,
+        percent_done=1.0,
+        status="seeding",
+    )
+    client = FakeClient(torrent)
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/未分类",
+            auto_classify=True,
+        )
+    )
+    await DownloadMonitor(client, FakeBot()).tick()
+    assert client.moved == []
+    assert DownloadQueue.get(1) is not None
+
+
+async def test_classify_failure_blocks_completion(env, tmp_path):
+    torrent = FakeTorrent(
+        name="FC2-PPV-1234567",
+        download_dir="/downloads/未分类",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        done_date=dt.datetime(2026, 10, 28, 12, 0, 0),
+        added_date=dt.datetime(2026, 10, 28, 11, 50, 0),
+    )
+
+    class FailingMoveClient(FakeClient):
+        def change_torrent(self, torrent_id, location=None, **kwargs):
+            raise RuntimeError("disk full")
+
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/未分类",
+            auto_classify=True,
+        )
+    )
+    await DownloadMonitor(FailingMoveClient(torrent), FakeBot()).tick()
+    assert DownloadQueue.get(1) is not None
+    assert not (tmp_path / "history.jsonl").exists()
+
+
+async def test_completion_failure_still_pauses(env):
+    torrent = FakeTorrent(
+        name="SSIS-123",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/有码",
+        done_date=dt.datetime(2026, 10, 28, 12, 0, 0),
+        added_date=dt.datetime(2026, 10, 28, 11, 50, 0),
+    )
+    client = FakeClient(torrent)
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=555,
+        )
+    )
+    monitor = DownloadMonitor(client, FailingBot())
+    monitor.pause_on_complete = True
+    await monitor.tick()
+    assert DownloadQueue.get(1) is not None
+    assert client.stopped == [1]

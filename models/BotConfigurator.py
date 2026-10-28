@@ -203,7 +203,10 @@ class BotConfigurator:
         的改动（如 allowed_users、label），运行时注入的 token、RPC 密码
         等一律不写回，写回时置为 None，避免旧密钥残留误导。"""
         if self._config is None:
-            _ = self.config
+            # 注意：不要写成 `_ = self.config`，那会把模块级 pydash（_）
+            # 遮蔽成本地变量，后面 _.set_ 必然失败还被 except 吞掉，
+            # 运行时密钥就清不掉了（sol 第二轮评审抓到的真 bug）。
+            self.config
         disk = copy.deepcopy(self._disk_config or {})
         runtime = BotConfigurator._runtime_overrides or {}
 
@@ -212,7 +215,12 @@ class BotConfigurator:
                 path = f"{prefix}.{key}" if prefix else str(key)
                 if path in runtime and runtime[path] is not None:
                     continue
-                if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                if isinstance(value, dict):
+                    # 磁盘缺整节时也不能整节复制：先建空节再递归，
+                    # 否则节里的运行时密钥（如 transmission.password）
+                    # 会跟着整节写回文件。
+                    if not isinstance(dst.get(key), dict):
+                        dst[key] = {}
                     _merge(dst[key], value, path)
                 else:
                     dst[key] = copy.deepcopy(value)
