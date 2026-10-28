@@ -289,4 +289,4 @@ git rebase upstream/main       # 有冲突时按提示解决
 
 ## 授权
 
-沿用上游 [MIT License](LICENSE.md)。
+沿用上游 GPLv3 License，见 [LICENSE.md](LICENSE.md)。本项目为上游的衍生作品，保留原作者版权声明，修改部分同样以 GPLv3 分发。
