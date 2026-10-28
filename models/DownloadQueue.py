@@ -37,6 +37,10 @@ class QueueEntry:
     milestones_sent: set[int] = field(default_factory=set)
     classified: bool = False
     final_dir: str | None = None
+    # 上次实际发出去的卡片文本：相同文本直接跳过，不再编辑也不重发，
+    # 否则速度/ peers / ETA 一变就每 45 秒刷一次。
+    last_card_text: str = ""
+    last_classify_fail_ts: float = 0.0
     notified_error: bool = False
     notified_stalled: bool = False
     last_progress_ts: float = field(default_factory=time.time)

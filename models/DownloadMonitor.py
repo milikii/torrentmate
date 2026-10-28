@@ -163,13 +163,18 @@ class DownloadMonitor:
         except Exception as err:  # noqa: BLE001
             # 移动失败时不要标记 classified：下一轮还会重试，而不是
             # 卡片显示目标目录、实际却永远没去成。
+            # 失败通知 1 小时内只发一次，否则每 30 秒一轮也是刷屏。
             log.error("任务 %s 自动归类失败: %s", torrent.name, err)
-            await self._send(
-                entry,
-                trans("CLASSIFY_FAILED", entry.lang_code).format(
-                    escape_html(torrent.name), escape_html(str(err))
-                ),
-            )
+            now = time.time()
+            if now - float(entry.last_classify_fail_ts or 0) >= 3600:
+                entry.last_classify_fail_ts = now
+                DownloadQueue.update(entry)
+                await self._send(
+                    entry,
+                    trans("CLASSIFY_FAILED", entry.lang_code).format(
+                        escape_html(torrent.name), escape_html(str(err))
+                    ),
+                )
             return False
 
         # 只有移动成功后才标记已归类、写最终目录。
@@ -279,20 +284,26 @@ class DownloadMonitor:
         percent = float(torrent.percent_done or 0) * 100
         now = time.time()
         if metadata:
-            # 元数据阶段只在第一次或间隔足够久时更新
-            if entry.last_edit_ts and now - entry.last_edit_ts < self.edit_interval:
+            # 元数据阶段文本基本不变，10 分钟更新一次就够了，
+            # 之前是 45 秒一次，一直刷。
+            if entry.last_edit_ts and now - entry.last_edit_ts < 600:
                 return
         else:
             changed = percent - float(entry.last_percent or 0) >= 5
-            if (
-                not changed
-                and now - float(entry.last_edit_ts or 0) < self.edit_interval
-            ):
-                return
+            if not changed:
+                # 进度没动（<5%）时不要每 45 秒编辑一次：速度、
+                # peers、ETA 一变文本就变，编辑本身就一直在刷。
+                # 静态进度最多 30 分钟更新一次，动了 5% 再立即更新。
+                if now - float(entry.last_edit_ts or 0) < 1800:
+                    return
 
         text = render_progress_card(
             torrent, entry.lang_code, entry.final_dir, entry.title
         )
+
+        # 文本和上次发出去的完全一样，直接跳过：不编辑、不重发。
+        if text == entry.last_card_text and entry.message_id:
+            return
 
         if entry.message_id:
             try:
@@ -304,10 +315,16 @@ class DownloadMonitor:
                     disable_web_page_preview=True,
                 )
             except TelegramError as err:
-                log.debug("进度卡片更新失败: %s", err)
-                message = await self._send(entry, text)
-                if message:
-                    entry.message_id = message.message_id
+                # 内容没变时 Telegram 会报 message is not modified，
+                # 这不是失败：原卡片已经是这个样子，不要再发一条新消息，
+                # 否则进度不动的任务每 45 秒就刷一条新通知。
+                if "not modified" in str(err).lower():
+                    log.debug("进度卡片内容未变，跳过重发")
+                else:
+                    log.debug("进度卡片更新失败: %s", err)
+                    message = await self._send(entry, text)
+                    if message:
+                        entry.message_id = message.message_id
         else:
             message = await self._send(entry, text)
             if message:
@@ -315,6 +332,7 @@ class DownloadMonitor:
 
         entry.last_edit_ts = now
         entry.last_percent = percent
+        entry.last_card_text = text
         DownloadQueue.update(entry)
 
         await self._maybe_milestone(torrent, entry, percent)

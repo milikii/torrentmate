@@ -383,3 +383,97 @@ async def test_completion_failure_still_pauses(env):
     await monitor.tick()
     assert DownloadQueue.get(1) is not None
     assert client.stopped == [1]
+
+
+async def test_progress_card_not_modified_does_not_resend(env):
+    torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
+
+    class NotModifiedBot(FakeBot):
+        async def edit_message_text(self, **kwargs):
+            raise TelegramError("Message is not modified")
+
+    bot = NotModifiedBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=555,
+            last_percent=30.0,
+            last_edit_ts=0.0,
+        )
+    )
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+    assert bot.sent == []
+    assert DownloadQueue.get(1).message_id == 555
+
+
+async def test_static_progress_is_not_updated_every_interval(env):
+    torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=555,
+            last_percent=30.0,
+            last_edit_ts=time.time() - 100,
+        )
+    )
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+    assert bot.sent == []
+    assert bot.edits == []
+
+
+async def test_identical_card_text_is_skipped(env):
+    torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+        )
+    )
+    monitor = DownloadMonitor(FakeClient(torrent), bot)
+    await monitor.tick()
+    first_sent = len(bot.sent)
+    first_edits = len(bot.edits)
+    assert first_sent == 1
+
+    # 30 分钟后再次轮询，文本没变（速度/peers 都一样），不应再编辑或重发。
+    entry = DownloadQueue.get(1)
+    entry.last_edit_ts = time.time() - 2000
+    entry.last_percent = 30.0
+    DownloadQueue.update(entry)
+    await monitor.tick()
+    assert len(bot.sent) == first_sent
+    assert len(bot.edits) == first_edits
+
+
+async def test_classify_failure_notice_is_throttled(env):
+    torrent = FakeTorrent(name="FC2-PPV-1234567", download_dir="/downloads/未分类")
+
+    class FailingMoveClient(FakeClient):
+        def change_torrent(self, torrent_id, location=None, **kwargs):
+            raise RuntimeError("disk full")
+
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/未分类",
+            auto_classify=True,
+        )
+    )
+    monitor = DownloadMonitor(FailingMoveClient(torrent), bot)
+    await monitor.tick()
+    await monitor.tick()
+    failed = [m for m in bot.sent if "归类失败" in m["text"]]
+    assert len(failed) == 1
