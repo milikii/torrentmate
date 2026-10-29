@@ -111,7 +111,7 @@ def _is_placeholder(value) -> bool:
 
 
 def _http_get(url: str, proxy: str | None, verify_tls: bool):
-    """统一出口：FC2 侧挂日本代理，nyaa 侧传 proxy=None 直连。"""
+    """统一出口：FC2、fc2ppvdb、nyaa 都走配置代理（NAS 直连已死，直连会超时）。"""
     proxies = {"http": proxy, "https": proxy} if proxy else None
     return requests.get(
         url,
@@ -227,9 +227,9 @@ def _download_images(
     return photos
 
 
-def _fetch_entries() -> list[dict]:
+def _fetch_entries(proxy: str | None = None) -> list[dict]:
     try:
-        response = _http_get(FEED_URL, None, True)
+        response = _http_get(FEED_URL, proxy, True)
     except Exception as err:  # noqa: BLE001
         log.warning("FC2 RSS 拉取失败: %s", err)
         return []
@@ -381,7 +381,7 @@ class Fc2Pusher:
             await asyncio.sleep(interval)
 
     async def _poll_once(self, channel_id) -> None:
-        entries = await asyncio.to_thread(_fetch_entries)
+        entries = await asyncio.to_thread(_fetch_entries, self._proxy())
         if not entries:
             return
         incremental = [

@@ -348,7 +348,7 @@ async def test_first_run_backfills_only_last_ten(tmp_path, monkeypatch):
         }
         for index in range(30)
     ]
-    monkeypatch.setattr(fc2, "_fetch_entries", lambda: entries)
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
     monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/x.jpg"])
     monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"bytes"])
     monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
