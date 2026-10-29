@@ -61,7 +61,7 @@ IMG_SRC_RE = re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", re.I)
 IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp|gif)(?:$|\?)", re.I)
 TAG_RE = re.compile(r'data-tag="([^"]+)"', re.I)
 DESC_RE = re.compile(
-    r'<meta[^>]+property=["\']og:description["\'][^>]*content=["\']([^"\']+)["\']', re.I
+    r'<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]*content=["\']([^"\']+)["\']', re.I
 )
 
 
@@ -218,35 +218,27 @@ def _censor_label(tags: list[str]) -> str:
 
 
 def _translate_ja_to_zh(text: str, proxy: str | None) -> str:
-    """日译中：先走配置的 NAS 代理，不通再换路，全部失败返回空串回退原文。
+    """日译中：谷歌翻译优先走配置代理，谷歌被挡时才用 MyMemory 兜底。
 
-    顺序：MyMemory 走配置代理（NAS 上就是 7890）-> MyMemory 走环境代理
-    （容器里 HTTP_PROXY 也是 7890，等于还是走代理）-> Google gtx 走配置代理。
-    Google gtx 在 NAS 代理下曾报 429，只当最后兜底，不靠它。只译前 400 字，
-    翻译失败绝不跳过卡片，调用方回退日文原文。
+    顺序：Google gtx 走配置代理（NAS 上就是 7890）-> Google gtx 走环境代理
+    -> MyMemory 走配置代理 -> MyMemory 走环境代理。实测谷歌 gtx 在 NAS
+    代理下会报 429（NAS 出口 IP 被谷歌限流，换 Hatch 出口就能通），
+    所以谷歌被挡时不硬等、不跳过卡片，自动降到 MyMemory 补一个翻译；
+    全部失败才返回空串，调用方回退日文原文。只译前 400 字。
     """
     if not text:
         return ""
+    proxy_dict = {"http": proxy, "https": proxy} if proxy else None
     attempts = []
     if proxy:
-        attempts.append(("mymemory", {"http": proxy, "https": proxy}))
-    attempts.append(("mymemory", None))
+        attempts.append(("google", proxy_dict))
+    attempts.append(("google", None))
     if proxy:
-        attempts.append(("google", {"http": proxy, "https": proxy}))
+        attempts.append(("mymemory", proxy_dict))
+    attempts.append(("mymemory", None))
     for provider, proxies in attempts:
         try:
-            if provider == "mymemory":
-                response = requests.get(
-                    "https://api.mymemory.translated.net/get",
-                    params={"q": text, "langpair": "ja|zh-CN"},
-                    proxies=proxies,
-                    timeout=15,
-                    headers={"User-Agent": USER_AGENT},
-                )
-                if response.status_code != 200:
-                    continue
-                translated = (response.json().get("responseData") or {}).get("translatedText") or ""
-            else:
+            if provider == "google":
                 response = requests.get(
                     "https://translate.googleapis.com/translate_a/single",
                     params={"client": "gtx", "sl": "ja", "tl": "zh-CN", "dt": "t", "q": text},
@@ -258,6 +250,17 @@ def _translate_ja_to_zh(text: str, proxy: str | None) -> str:
                     continue
                 data = response.json()
                 translated = "".join(part[0] for part in (data[0] or []) if part)
+            else:
+                response = requests.get(
+                    "https://api.mymemory.translated.net/get",
+                    params={"q": text, "langpair": "ja|zh-CN"},
+                    proxies=proxies,
+                    timeout=15,
+                    headers={"User-Agent": USER_AGENT},
+                )
+                if response.status_code != 200:
+                    continue
+                translated = (response.json().get("responseData") or {}).get("translatedText") or ""
             translated = translated.strip()
             if translated and "QUERY_LENGTH_LIMIT" not in translated and translated != text:
                 return translated
@@ -332,6 +335,61 @@ def _download_images(
             continue
         photos.append(response.content)
     return photos
+
+
+NYAA_DETAIL_LIMIT = 3
+NYAA_IMAGE_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:jpe?g|png|webp)", re.I)
+IMAGETWIST_IMG_RE = re.compile(r"https?://img\d+\.imagetwist\.com/i/[^\"'\s]+", re.I)
+NYAA_IMAGE_BLOCK = ("favicon", "static_flyer", "apiplayer", "/static/", "logo")
+
+
+def _resolve_imagetwist(url: str, proxy: str | None, verify_tls: bool) -> str:
+    """imagetwist 详情页本身是 HTML 查看页，不是图片，取页内 img*.imagetwist.com/i/ 真图。
+
+    取不到真图就返回空串，调用方跳过这张，不把查看页 HTML 当图片发出去。
+    """
+    try:
+        response = _http_get(url, proxy, verify_tls)
+    except Exception as err:  # noqa: BLE001
+        log.debug("imagetwist 查看页请求失败 %s: %s", url, err)
+        return ""
+    if response.status_code != 200:
+        return ""
+    for candidate in IMAGETWIST_IMG_RE.findall(response.text or ""):
+        if "/th/" not in candidate:
+            return candidate
+    return ""
+
+
+def _nyaa_detail_images(guid: str | None, proxy: str | None, verify_tls: bool) -> list[str]:
+    """nyaa 详情页附图：从种子描述里提图片 URL，最多 3 张。
+
+    描述是 Markdown/纯文本，没有 <img> 标签，所以直接扫图片 URL。
+    imagetwist 的链接要先解析成真图 URL；广告飞图、favicon、logo 直接过滤；
+    去掉 #gallery 这类 fragment 后去重。nyaa 详情页本身走代理拉取。
+    """
+    if not guid:
+        return []
+    try:
+        response = _http_get(guid, proxy, verify_tls)
+    except Exception as err:  # noqa: BLE001
+        log.debug("nyaa 详情页请求失败 %s: %s", guid, err)
+        return []
+    if response.status_code != 200:
+        return []
+    images: list[str] = []
+    for raw in NYAA_IMAGE_RE.findall(response.text or ""):
+        url = raw.split("#")[0].strip().rstrip(".,)")
+        if not url or any(block in url for block in NYAA_IMAGE_BLOCK):
+            continue
+        if "imagetwist.com" in url:
+            url = _resolve_imagetwist(url, proxy, verify_tls)
+            if not url:
+                continue
+        _append_unique(images, url)
+        if len(images) >= NYAA_DETAIL_LIMIT:
+            break
+    return images
 
 
 def _fetch_entries(proxy: str | None = None) -> list[dict]:
@@ -554,6 +612,14 @@ class Fc2Pusher:
         if not images:
             log.debug("FC2 官网未确认编号 %s，跳过", number)
             return
+        # nyaa 附图放官网图后面，最多补到媒体组上限 10 张
+        detail_images = await asyncio.to_thread(
+            _nyaa_detail_images, entry.get("guid"), proxy, verify_tls
+        )
+        for url in detail_images:
+            if len(images) >= 10:
+                break
+            _append_unique(images, url)
         photos = await asyncio.to_thread(_download_images, images, proxy, verify_tls)
         if not photos:
             log.debug("FC2 编号 %s 没有可用图片，跳过", number)

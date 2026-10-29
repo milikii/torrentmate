@@ -466,3 +466,52 @@ def test_keyboard_has_fc2_official_url_button():
 def test_translate_failure_returns_empty(monkeypatch):
     monkeypatch.setattr(fc2.requests, "get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     assert fc2._translate_ja_to_zh("可愛い", None) == ""
+
+
+# ---------------------------------------------------------------- nyaa 附图 + 谷歌翻译优先
+
+NYAA_VIEW_HTML = """
+<html><body>
+<div id="torrent-description">
+[![poster](https://s3.example.com/poster/FC2-PPV-5000545.jpg)](https://manko.fun)
+https://imagetwist.com/abc123/240107020601c1b44.jpg#gallery
+[![flyer](https://apiplayer.b-cdn.net/images/static_flyer.jpg)](https://manko.fun)
+</div>
+</body></html>
+"""
+
+
+def test_nyaa_detail_images_resolves_imagetwist_and_filters_ads(monkeypatch):
+    def fake_http(url, proxy, verify_tls):
+        if "imagetwist.com" in url:
+            return page('<img src="https://img400.imagetwist.com/i/80069/abc123.jpg/240107020601c1b44.jpg">')
+        return page(NYAA_VIEW_HTML)
+
+    monkeypatch.setattr(fc2, "_http_get", fake_http)
+    images = fc2._nyaa_detail_images("https://sukebei.nyaa.si/view/4748878", None, True)
+    assert images == [
+        "https://s3.example.com/poster/FC2-PPV-5000545.jpg",
+        "https://img400.imagetwist.com/i/80069/abc123.jpg/240107020601c1b44.jpg",
+    ]
+
+
+def test_nyaa_detail_images_empty_guid():
+    assert fc2._nyaa_detail_images(None, None, True) == []
+
+
+def test_translate_prefers_google_over_mymemory(monkeypatch):
+    class GoogleResp:
+        status_code = 200
+
+        def json(self):
+            return [[["谷歌翻译结果", "元サッカー", None, None, 3]], None, "ja"]
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return GoogleResp()
+
+    monkeypatch.setattr(fc2.requests, "get", fake_get)
+    assert fc2._translate_ja_to_zh("元サッカー", "http://proxy:7890") == "谷歌翻译结果"
+    assert "translate.googleapis.com" in calls[0]
