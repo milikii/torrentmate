@@ -51,6 +51,14 @@ _DOMAIN_SUFFIXES = (
     " info",
 )
 
+_DOMESTIC_STUDIOS_PATTERN = "麻豆|天美|果冻|精东|星空|蜜桃|糖心|含羞草|香蕉|探花|司机社"
+_DOMESTIC_91_PATTERNS = (
+    r"(?<![A-Za-z0-9])91[\s._-]*(?:制片[厂廠]|[传傳]媒|原[创創]|大神|"
+    r"(?:夯|沈|秦)?先生|视[频頻]|自拍|精品|"
+    r"porn(?:[\s._-]*com)?(?![A-Za-z0-9]))",
+    r"(?<![A-Za-z0-9])91[\s._-]*CM[\s._-]*\d{2,5}(?![A-Za-z0-9])",
+)
+
 DEFAULT_RULES: list[dict[str, Any]] = [
     {
         "name": "fc2",
@@ -65,7 +73,8 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "dir": "国产",
         "patterns": [
             r"国产|國產|国内自拍|自拍流出",
-            r"麻豆|天美|果冻|精东|星空|蜜桃|糖心|含羞草|香蕉|探花|司机社|91",
+            _DOMESTIC_STUDIOS_PATTERN,
+            *_DOMESTIC_91_PATTERNS,
             r"MD[\s._-]?\d{3,5}",
             r"SWAG|ONLYFANS|FANSLY|JVID",
             r"(?:^|[^A-Za-z])GD[\s._-]?\d{3,5}",
@@ -166,10 +175,16 @@ class Classifier:
                 patterns = [patterns]
             regexes = []
             for pattern in patterns:
-                try:
-                    regexes.append(re.compile(str(pattern), re.IGNORECASE))
-                except re.error as err:
-                    log.error("分类规则 %s 的正则无效: %s (%s)", name, pattern, err)
+                candidates = [pattern]
+                if name == "国产" and pattern == f"{_DOMESTIC_STUDIOS_PATTERN}|91":
+                    # 兼容已经写入配置的旧默认规则，只在内存中收窄裸 91，
+                    # 不改配置文件，也不改变其它自定义规则的含义。
+                    candidates = [_DOMESTIC_STUDIOS_PATTERN, *_DOMESTIC_91_PATTERNS]
+                for candidate in candidates:
+                    try:
+                        regexes.append(re.compile(str(candidate), re.IGNORECASE))
+                    except re.error as err:
+                        log.error("分类规则 %s 的正则无效: %s (%s)", name, candidate, err)
             if name and regexes:
                 compiled.append(
                     ClassifyRule(

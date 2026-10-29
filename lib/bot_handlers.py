@@ -34,7 +34,7 @@ from lib.func import (
     trans,
 )
 from lib.i18n import button_label_key_text, button_regex
-from lib.magnet import MagnetLink, extract_magnets
+from lib.magnet import MagnetLink, extract_magnets, parse_magnet
 from lib.render import render_progress_card
 from models.BotConfigurator import BotConfigurator
 from models.Browser import Browser
@@ -298,12 +298,34 @@ async def _add_batch(  # noqa: C901
 ):
     query = update.callback_query
     lang_code = query.from_user.language_code
-    links: list[MagnetLink] = context.user_data.pop("batch", [])
+    links: list[MagnetLink | str | pathlib.Path] = context.user_data.pop("batch", [])
     if not links:
         return
 
-    client = get_torrent_connection()
-    existing = await asyncio.to_thread(client.existing_hashes)
+    try:
+        client = get_torrent_connection()
+        existing = {
+            str(info_hash).lower(): torrent
+            for info_hash, torrent in (
+                await asyncio.to_thread(client.existing_hashes)
+            ).items()
+        }
+    except Exception as err:  # noqa: BLE001
+        # 查重失败不能按空库继续添加，RPC 返回已有任务时会覆盖通知队列。
+        # 保留批量预览，用户可以重试原目录按钮，不丢待添加任务。
+        context.user_data["batch"] = links
+        log.warning("批量查重失败，未添加任何任务: %s", err)
+        await context.bot.send_message(
+            chat_id=query.message.chat.id,
+            text=(
+                trans("SOMETHING_WENT_WRONG", lang_code)
+                + ":\n"
+                + escape_html(str(err))
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    seen_paths = {}
     show_cards = len(links) <= 8 and bool(bot_config.get("notify.progress", True))
 
     chat_id = query.message.chat.id
@@ -320,25 +342,58 @@ async def _add_batch(  # noqa: C901
         message_id = None
 
     added, duplicates, failed = [], [], []
-    for index, link in enumerate(links, 1):
-        target, auto = _resolve_target(dir_choice, link.name)
-        if link.info_hash in existing:
-            duplicates.append((link, existing[link.info_hash]))
-            continue
+    for index, item in enumerate(links, 1):
+        if isinstance(item, MagnetLink):
+            link = item
+        else:
+            link = parse_magnet(str(item)) or MagnetLink(
+                raw=str(item), info_hash="", name=pathlib.Path(item).stem
+            )
+        info_hash = str(link.info_hash or "").lower()
         try:
+            torrent_source = link.raw
+            path = None
+            if (
+                isinstance(torrent_source, pathlib.Path)
+                or not str(torrent_source).lower().startswith(
+                    ("magnet:", "http://", "https://")
+                )
+            ):
+                path = pathlib.Path(torrent_source).resolve()
+                if path in seen_paths:
+                    duplicates.append((link, seen_paths[path]))
+                    continue
+                # 字符串路径会被 transmission_rpc 当成服务器上的文件名，
+                # 批量文件统一用 Path，并在 RPC 添加前读取 info_hash 查重。
+                torrent_source = path
+                info_hash = await asyncio.to_thread(
+                    TransmissionClient.torrent_file_hash, path
+                )
+            if info_hash and info_hash in existing:
+                duplicates.append((link, existing[info_hash]))
+                if path is not None:
+                    seen_paths[path] = existing[info_hash]
+                continue
+            target, auto = _resolve_target(dir_choice, link.name)
             torrent = await asyncio.to_thread(
                 client.add_torrent,
                 chat_id=chat_id,
                 lang_code=lang_code,
-                torrent=link.raw,
+                torrent=torrent_source,
                 download_dir=target,
                 title=link.name,
                 auto_classify=auto,
             )
-            existing[link.info_hash] = torrent
+            if info_hash:
+                existing[info_hash] = torrent
+            actual_hash = str(getattr(torrent, "info_hash", "") or "").lower()
+            if actual_hash:
+                existing[actual_hash] = torrent
+            if path is not None:
+                seen_paths[path] = torrent
             added.append((link, torrent, target, auto))
         except Exception as err:  # noqa: BLE001
-            log.error("添加磁力链接失败 %s: %s", link.info_hash, err)
+            log.error("添加批量任务失败 %s: %s", info_hash or link.raw, err)
             failed.append((link, err))
 
         if message_id and index % 3 == 0:

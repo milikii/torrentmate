@@ -1,3 +1,5 @@
+import hashlib
+from pathlib import Path
 from typing import Union, Any, BinaryIO
 from telegram import Bot
 from typing_extensions import Literal
@@ -79,14 +81,54 @@ class TransmissionClient(Client):
         )
         return _torrent
 
+    @staticmethod
+    def torrent_file_hash(path: Path) -> str:
+        """批量查重专用：对种子文件原始 info 字典求 SHA-1，不重编码。"""
+        data = path.read_bytes()
+
+        def read_string(start: int) -> tuple[bytes, int]:
+            colon = data.index(b":", start)
+            length = data[start:colon]
+            if not length.isdigit():
+                raise ValueError("Invalid torrent metainfo string")
+            end = colon + 1 + int(length)
+            if end > len(data):
+                raise ValueError("Truncated torrent metainfo string")
+            return data[colon + 1 : end], end
+
+        def skip_value(start: int) -> int:
+            token = data[start : start + 1]
+            if token in (b"d", b"l"):
+                end = start + 1
+                while data[end : end + 1] != b"e":
+                    end = skip_value(end)
+                return end + 1
+            if token == b"i":
+                end = data.index(b"e", start + 1)
+                int(data[start + 1 : end])
+                return end + 1
+            if token and token.isdigit():
+                return read_string(start)[1]
+            raise ValueError("Invalid torrent metainfo value")
+
+        if data[:1] != b"d":
+            raise ValueError("Torrent metainfo must be a dictionary")
+        cursor = 1
+        while data[cursor : cursor + 1] != b"e":
+            key, start = read_string(cursor)
+            end = skip_value(start)
+            if key == b"info":
+                if data[start : start + 1] != b"d":
+                    raise ValueError("Torrent info must be a dictionary")
+                return hashlib.sha1(data[start:end]).hexdigest()
+            cursor = end
+        raise ValueError("Torrent metainfo has no info dictionary")
+
     def existing_hashes(self) -> dict[str, Torrent]:
-        """返回 info_hash → 任务 的映射，用于批量查重。"""
+        """返回 info_hash → 任务 的映射；读取失败上抛，不能当作空库。"""
         existing: dict[str, Torrent] = {}
-        try:
-            for torrent in self.get_torrents():
-                existing[str(torrent.info_hash).lower()] = torrent
-        except Exception as err:  # noqa: BLE001
-            log.warning("读取任务列表失败，跳过查重: %s", err)
+        for torrent in self.get_torrents():
+            existing[str(torrent.info_hash).lower()] = torrent
         return existing
 
     def stop_all(self) -> None:

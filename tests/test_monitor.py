@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from lib.classifier import DEFAULT_RULES
+from lib.func import trans
 from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
 from models.DownloadMonitor import DownloadMonitor
@@ -409,7 +410,9 @@ async def test_progress_card_not_modified_does_not_resend(env):
     assert DownloadQueue.get(1).message_id == 555
 
 
-async def test_static_progress_is_not_updated_every_interval(env):
+async def test_static_progress_is_not_updated_every_interval(env, monkeypatch):
+    now = [10000.0]
+    monkeypatch.setattr("models.DownloadMonitor.time.time", lambda: now[0])
     torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
     bot = FakeBot()
     DownloadQueue.add(
@@ -420,12 +423,22 @@ async def test_static_progress_is_not_updated_every_interval(env):
             requested_dir="/downloads/有码",
             message_id=555,
             last_percent=30.0,
-            last_edit_ts=time.time() - 100,
+            last_edit_ts=now[0] - 100,
         )
     )
-    await DownloadMonitor(FakeClient(torrent), bot).tick()
+    monitor = DownloadMonitor(FakeClient(torrent), bot)
+    await monitor.tick()
     assert bot.sent == []
     assert bot.edits == []
+
+    torrent.rate_download = 2048
+    now[0] += 1699
+    await monitor.tick()
+    assert bot.edits == []
+    now[0] += 1
+    await monitor.tick()
+    assert len(bot.edits) == 1
+    assert bot.sent == []
 
 
 async def test_identical_card_text_is_skipped(env):
@@ -455,7 +468,9 @@ async def test_identical_card_text_is_skipped(env):
     assert len(bot.edits) == first_edits
 
 
-async def test_classify_failure_notice_is_throttled(env):
+async def test_classify_failure_notice_is_throttled(env, monkeypatch):
+    now = [10000.0]
+    monkeypatch.setattr("models.DownloadMonitor.time.time", lambda: now[0])
     torrent = FakeTorrent(name="FC2-PPV-1234567", download_dir="/downloads/未分类")
 
     class FailingMoveClient(FakeClient):
@@ -477,3 +492,109 @@ async def test_classify_failure_notice_is_throttled(env):
     await monitor.tick()
     failed = [m for m in bot.sent if "归类失败" in m["text"]]
     assert len(failed) == 1
+    now[0] += 3599
+    await monitor.tick()
+    assert len(bot.sent) == 1
+    now[0] += 1
+    await monitor.tick()
+    assert len(bot.sent) == 2
+
+
+async def test_failed_progress_delivery_does_not_cache_unsent_text(env):
+    torrent = FakeTorrent(percent_done=0.3)
+    client = FakeClient(torrent)
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            message_id=555,
+            last_percent=10.0,
+            last_card_text="previous delivered card",
+        )
+    )
+    monitor = DownloadMonitor(client, FailingBot())
+    await monitor.tick()
+    entry = DownloadQueue.get(1)
+    assert entry.last_card_text == "previous delivered card"
+    assert entry.last_percent == 10.0
+    assert entry.last_edit_ts == 0.0
+
+    monitor.bot = FakeBot()
+    await monitor.tick()
+    assert len(monitor.bot.edits) == 1
+    assert monitor.bot.sent == []
+    assert DownloadQueue.get(1).last_card_text == monitor.bot.edits[0]["text"]
+
+
+async def test_failed_classify_notice_is_retried_before_throttle(env):
+    class FailingMoveClient(FakeClient):
+        def change_torrent(self, torrent_id, location=None, **kwargs):
+            raise RuntimeError("disk full")
+
+    torrent = FakeTorrent(name="FC2-PPV-1234567")
+    DownloadQueue.add(
+        QueueEntry(torrent_id=1, chat_id=9, lang_code="zh", auto_classify=True)
+    )
+    monitor = DownloadMonitor(FailingMoveClient(torrent), FailingBot())
+    await monitor.tick()
+    assert DownloadQueue.get(1).last_classify_fail_ts == 0.0
+
+    monitor.bot = FakeBot()
+    await monitor.tick()
+    await monitor.tick()
+    assert len(monitor.bot.sent) == 1
+    assert "归类失败" in monitor.bot.sent[0]["text"]
+
+
+async def test_metadata_card_is_throttled_for_ten_minutes(env, monkeypatch):
+    now = [10000.0]
+    monkeypatch.setattr("models.DownloadMonitor.time.time", lambda: now[0])
+    torrent = FakeTorrent(metadata_percent_complete=0.5, percent_done=0.0)
+    bot = FakeBot()
+    DownloadQueue.add(QueueEntry(torrent_id=1, chat_id=9, lang_code="zh"))
+    monitor = DownloadMonitor(FakeClient(torrent), bot)
+    await monitor.tick()
+    assert len(bot.sent) == 1
+    assert "元数据" in bot.sent[0]["text"]
+
+    torrent.status = "stopped"
+    now[0] += 599
+    await monitor.tick()
+    assert bot.edits == []
+    now[0] += 1
+    await monitor.tick()
+    assert len(bot.edits) == 1
+    assert len(bot.sent) == 1
+
+
+async def test_failed_milestone_is_retried_when_card_text_is_identical(env):
+    write_config(env, milestones=[25])
+
+    milestone_text = trans("MILESTONE", "zh").format("SSIS-123", 25)
+
+    class FailMilestoneOnceBot(FakeBot):
+        failed = False
+
+        async def send_message(self, **kwargs):
+            if kwargs["text"] == milestone_text and not self.failed:
+                self.failed = True
+                raise TelegramError("telegram down")
+            return await super().send_message(**kwargs)
+
+    bot = FailMilestoneOnceBot()
+    DownloadQueue.add(QueueEntry(torrent_id=1, chat_id=9, lang_code="zh"))
+    monitor = DownloadMonitor(FakeClient(FakeTorrent(percent_done=0.3)), bot)
+    await monitor.tick()
+    assert bot.failed
+    assert DownloadQueue.get(1).milestones_sent == set()
+    assert len(bot.sent) == 1
+
+    entry = DownloadQueue.get(1)
+    entry.last_edit_ts -= 2000
+    DownloadQueue.update(entry)
+    await monitor.tick()
+    await monitor.tick()
+    assert DownloadQueue.get(1).milestones_sent == {25}
+    assert len(bot.sent) == 2
+    assert bot.edits == []

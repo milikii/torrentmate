@@ -25,6 +25,16 @@ def classifier() -> Classifier:
         ("hhd800.com@IPX-999.mp4", "有码"),
         ("麻豆传媒MD-0123 国产剧情", "国产"),
         ("糖心VLOG 约啪 2024", "国产"),
+        ("MD-0123 高清剧情", "国产"),
+        ("91制片厂 高清剧情", "国产"),
+        ("91CM-123 高清剧情", "国产"),
+        ("91 原创 合集", "国产"),
+        ("91大神 高清合集", "国产"),
+        ("91沈先生 高清合集", "国产"),
+        ("[91porn] 自拍合集", "国产"),
+        ("91porn.com@自拍合集", "国产"),
+        ("SSIS-091 中文字幕 1080p", "有码"),
+        ("hhd800.com@IPX-191.mp4", "有码"),
         ("[无码] ABC-123 uncensored", "无码"),
         ("1pondo 123456_001", "无码"),
     ],
@@ -40,6 +50,10 @@ def test_classification(classifier: Classifier, name: str, expected: str):
         "Some.Movie.2024.2160p.HEVC.AAC",
         "HEVC-10bit",
         "DD5.1",
+        "Some.Movie.1991.1080p.WEB-DL.x264",
+        "普通电影 91 1080p",
+        "91",
+        "0123456789abcdef0123456789abcdef01234591",
         "",
     ],
 )
@@ -61,6 +75,20 @@ def test_custom_rules_and_disabled_rule():
     ]
     classifier = Classifier(rules=rules, directories=DIRECTORIES)
     assert classifier.classify("abc-123").directory == "国产"
+
+
+def test_legacy_default_91_rule_is_narrowed_without_mutating_config():
+    legacy_pattern = "麻豆|天美|果冻|精东|星空|蜜桃|糖心|含羞草|香蕉|探花|司机社|91"
+    rules = [
+        {"name": "国产", "dir": "国产", "patterns": [legacy_pattern]},
+        DEFAULT_RULES[-1],
+    ]
+    classifier = Classifier(rules=rules, directories=DIRECTORIES)
+
+    assert classifier.classify("SSIS-091").directory == "有码"
+    assert classifier.classify("91制片厂 高清剧情").directory == "国产"
+    assert classifier.classify("91CM-123").directory == "国产"
+    assert rules[0]["patterns"] == [legacy_pattern]
 
 
 def test_resolve_path_falls_back_to_defaults():

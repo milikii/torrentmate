@@ -167,14 +167,15 @@ class DownloadMonitor:
             log.error("任务 %s 自动归类失败: %s", torrent.name, err)
             now = time.time()
             if now - float(entry.last_classify_fail_ts or 0) >= 3600:
-                entry.last_classify_fail_ts = now
-                DownloadQueue.update(entry)
-                await self._send(
+                sent = await self._send(
                     entry,
                     trans("CLASSIFY_FAILED", entry.lang_code).format(
                         escape_html(torrent.name), escape_html(str(err))
                     ),
                 )
+                if sent is not None:
+                    entry.last_classify_fail_ts = now
+                    DownloadQueue.update(entry)
             return False
 
         # 只有移动成功后才标记已归类、写最终目录。
@@ -282,6 +283,10 @@ class DownloadMonitor:
             return
 
         percent = float(torrent.percent_done or 0) * 100
+        if not metadata:
+            # 节点通知独立于卡片节流；失败的节点通知不能被相同文本
+            # 的提前返回永久跳过，成功后仍由 milestones_sent 去重。
+            await self._maybe_milestone(torrent, entry, percent)
         now = time.time()
         if metadata:
             # 元数据阶段文本基本不变，10 分钟更新一次就够了，
@@ -305,6 +310,7 @@ class DownloadMonitor:
         if text == entry.last_card_text and entry.message_id:
             return
 
+        delivered = False
         if entry.message_id:
             try:
                 await self.bot.edit_message_text(
@@ -314,28 +320,34 @@ class DownloadMonitor:
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
+                delivered = True
             except TelegramError as err:
                 # 内容没变时 Telegram 会报 message is not modified，
                 # 这不是失败：原卡片已经是这个样子，不要再发一条新消息，
                 # 否则进度不动的任务每 45 秒就刷一条新通知。
                 if "not modified" in str(err).lower():
                     log.debug("进度卡片内容未变，跳过重发")
+                    delivered = True
                 else:
                     log.debug("进度卡片更新失败: %s", err)
                     message = await self._send(entry, text)
-                    if message:
+                    if message is not None:
                         entry.message_id = message.message_id
+                        delivered = True
         else:
             message = await self._send(entry, text)
-            if message:
+            if message is not None:
                 entry.message_id = message.message_id
+                delivered = True
 
+        if not delivered:
+            # 不缓存未送达的文本/进度，否则旧 message_id 会让后续
+            # 相同文本直接跳过，卡片在 Telegram 恢复后也无法补发。
+            return
         entry.last_edit_ts = now
         entry.last_percent = percent
         entry.last_card_text = text
         DownloadQueue.update(entry)
-
-        await self._maybe_milestone(torrent, entry, percent)
 
     async def _maybe_milestone(
         self, torrent: Torrent, entry: QueueEntry, percent: float

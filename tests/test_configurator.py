@@ -86,6 +86,34 @@ def test_config_reloads_after_other_instance_saves(tmp_path):
         BotConfigurator.config_file = original_file
 
 
+def test_save_before_loading_clears_overridden_disk_secrets(tmp_path):
+    config_file = tmp_path / "torrentino.yaml"
+    config_file.write_text(
+        "bot:\n  token: old-test-token\n  label: keep\n"
+        "transmission:\n  password: old-test-password\n",
+        encoding="utf-8",
+    )
+    original_file = BotConfigurator.config_file
+    original_overrides = BotConfigurator._runtime_overrides
+    try:
+        BotConfigurator.config_file = str(config_file)
+        BotConfigurator._runtime_overrides = {
+            "bot.token": "runtime-test-token",
+            "transmission.password": "runtime-test-password",
+        }
+        configurator = BotConfigurator()
+        configurator.save_config()
+        stored = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        assert stored["bot"]["token"] is None
+        assert stored["transmission"]["password"] is None
+        assert stored["bot"]["label"] == "keep"
+        assert configurator.get("bot.token") == "runtime-test-token"
+        assert configurator.get("transmission.password") == "runtime-test-password"
+    finally:
+        BotConfigurator.config_file = original_file
+        BotConfigurator._runtime_overrides = original_overrides
+
+
 def test_add_user_does_not_leak_missing_section_runtime_secrets(tmp_path):
     config_file = tmp_path / "torrentino.yaml"
     config_file.write_text("bot: {}\n", encoding="utf-8")
