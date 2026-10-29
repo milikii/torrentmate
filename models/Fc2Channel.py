@@ -59,6 +59,10 @@ THUMB_RE = re.compile(
 )
 IMG_SRC_RE = re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", re.I)
 IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp|gif)(?:$|\?)", re.I)
+TAG_RE = re.compile(r'data-tag="([^"]+)"', re.I)
+DESC_RE = re.compile(
+    r'<meta[^>]+property=["\']og:description["\'][^>]*content=["\']([^"\']+)["\']', re.I
+)
 
 
 def extract_number(title: str) -> str | None:
@@ -175,6 +179,86 @@ def _fetch_official(number: str, proxy: str | None, verify_tls: bool) -> list[st
     return _official_images(html)
 
 
+def _official_tags(html: str) -> list[str]:
+    """官网商品标签（data-tag），按页面顺序去重。"""
+    tags: list[str] = []
+    for tag in TAG_RE.findall(html or ""):
+        tag = html_module.unescape(tag).strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _official_description(html: str) -> str:
+    """官网 og:description，去掉开头的 FC2-PPV 编号，截断到 400 字供翻译。"""
+    match = DESC_RE.search(html or "")
+    if not match:
+        return ""
+    text = html_module.unescape(match.group(1))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^FC2-PPV-\d+\s*", "", text)
+    return text[:400]
+
+
+def _censor_label(tags: list[str], description: str) -> str:
+    """有码/无码/薄码三选一：無修正优先，薄モザイク/薄消し次之，其余默认有码。
+
+    注意：默认有码是 FC2 下载版的常态，个别卖家把无码版放购买者消息里的
+    （如 4973177 详情写下载版有马赛克、无码版在消息里），按标签会判成有码，
+    这是按下载版判的，不算误判成无码。
+    """
+    text = " ".join(tags or []) + " " + (description or "")
+    if "無修正" in text:
+        return "无码"
+    if "薄モザイク" in text or "薄消し" in text:
+        return "薄码"
+    return "有码"
+
+
+def _translate_ja_to_zh(text: str, proxy: str | None) -> str:
+    """日译中：走 MyMemory 免费接口，失败/超配额返回空串，调用方回退原文。
+
+    Google 翻译 gtx 在 NAS 代理下报 429 不可用，MyMemory 实测可用，
+    匿名配额有限所以只译前 400 字，超了就回退原文不跳过卡片。
+    """
+    if not text:
+        return ""
+    try:
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        response = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": "ja|zh-CN"},
+            proxies=proxies,
+            timeout=15,
+            headers={"User-Agent": USER_AGENT},
+        )
+        if response.status_code != 200:
+            return ""
+        translated = (response.json().get("responseData") or {}).get("translatedText") or ""
+        translated = translated.strip()
+        if not translated or "QUERY_LENGTH_LIMIT" in translated or translated == text:
+            return ""
+        return translated
+    except Exception as err:  # noqa: BLE001
+        log.debug("FC2 详情翻译失败: %s", err)
+        return ""
+
+
+def _fetch_official_detail(number: str, proxy: str | None, verify_tls: bool) -> tuple[list[str], str]:
+    """官网详情：返回（商品标签，日文详情），官网不过或请求失败返回空。"""
+    try:
+        response = _http_get(ARTICLE_URL.format(number), proxy, verify_tls)
+    except Exception as err:  # noqa: BLE001
+        log.debug("FC2 官网详情请求失败 %s: %s", number, err)
+        return [], ""
+    if response.status_code != 200:
+        return [], ""
+    html = response.text or ""
+    if not re.search(rf"FC2-PPV-{number}", _page_title(html), re.I):
+        return [], ""
+    return _official_tags(html), _official_description(html)
+
+
 def _fetch_fc2ppvdb(number: str, proxy: str | None, verify_tls: bool) -> list[str]:
     try:
         response = _http_get(FC2PPVDB_URL.format(number), proxy, verify_tls)
@@ -250,17 +334,28 @@ def _clean_title(title: str, number: str) -> str:
     return escape_html(text[:900]) or f"FC2-PPV-{number}"
 
 
-def _caption(entry: dict, number: str) -> str:
+def _caption(entry: dict, number: str, censor_label: str = "", detail: str = "") -> str:
     size = escape_html(entry.get("size") or "-")
     when = datetime.fromtimestamp(float(entry.get("pub_ts") or 0)).strftime(
         "%Y-%m-%d %H:%M"
     )
+    title = _clean_title(entry.get("title") or "", number)
+    if len(title) > 200:
+        title = title[:197] + "…"
     lines = [
         f"<b>FC2-PPV-{number}</b>",
+    ]
+    if censor_label:
+        lines.append(f"🏷️ {escape_html(censor_label)}")
+    lines += [
         "",
-        _clean_title(entry.get("title") or "", number),
+        title,
         f"💾 {size} · 🕒 {escape_html(when)}",
     ]
+    if detail:
+        detail_text = re.sub(r"\s+", " ", str(detail)).strip()[:250]
+        if detail_text:
+            lines += ["", f"📝 {escape_html(detail_text)}"]
     guid = entry.get("guid")
     if guid:
         lines.append(f'<a href="{escape_html(guid)}">nyaa</a>')
@@ -273,7 +368,12 @@ def _keyboard(number: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("⬇️ 下载", callback_data=f"fc2dl:{number}"),
                 InlineKeyboardButton("🚫 不感兴趣", callback_data=f"fc2no:{number}"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔗 FC2 官网", url=ARTICLE_URL.format(number)
+                ),
+            ],
         ]
     )
 
@@ -436,7 +536,10 @@ class Fc2Pusher:
             log.debug("FC2 编号 %s 没有可用图片，跳过", number)
             return
 
-        caption = _caption(entry, number)
+        tags, description_ja = _fetch_official_detail(number, proxy, verify_tls)
+        censor = _censor_label(tags, description_ja)
+        detail_zh = _translate_ja_to_zh(description_ja, proxy) if description_ja else ""
+        caption = _caption(entry, number, censor_label=censor, detail=detail_zh or description_ja)
         keyboard = _keyboard(number)
         try:
             if len(photos) == 1:

@@ -408,3 +408,60 @@ async def test_run_without_channel_id_only_warns(tmp_path, monkeypatch, caplog):
 
     assert calls == []
     assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+# ---------------------------------------------------------------- 码标签 + 详情翻译
+
+DETAIL_HTML = """
+<html><head>
+<title>FC2-PPV-4974501 title</title>
+<meta property="og:description" content="FC2-PPV-4974501 可愛い素人の高画質版です" />
+</head><body>
+<a class="tag tagTag" data-article-tag href="/search/?tag=%E7%84%A1%E4%BF%AE%E6%AD%A3" data-tag="無修正">無修正</a>
+<a class="tag tagTag" data-article-tag href="/search/?tag=%E7%B4%A0%E4%BA%BA" data-tag="素人">素人</a>
+</body></html>
+"""
+
+
+def test_official_tags_and_description():
+    assert fc2._official_tags(DETAIL_HTML) == ["無修正", "素人"]
+    assert fc2._official_description(DETAIL_HTML) == "可愛い素人の高画質版です"
+
+
+@pytest.mark.parametrize(
+    "tags, description, expected",
+    [
+        (["無修正"], "", "无码"),
+        (["素人"], "薄モザイク版です", "薄码"),
+        (["素人"], "薄消し版です", "薄码"),
+        (["素人"], "ダウンロード版にはモザイクをかけています", "有码"),
+        (["素人"], "", "有码"),
+    ],
+)
+def test_censor_label(tags, description, expected):
+    assert fc2._censor_label(tags, description) == expected
+
+
+def test_caption_contains_censor_and_detail():
+    caption = fc2._caption(
+        {"title": "+++ FC2-PPV-4974501 sample", "size": "1 GiB", "pub_ts": 1000, "guid": "https://sukebei.nyaa.si/view/4974501"},
+        "4974501",
+        censor_label="无码",
+        detail="这是翻译后的详情",
+    )
+    assert "🏷️ 无码" in caption
+    assert "这是翻译后的详情" in caption
+    assert len(caption) <= 1024
+
+
+def test_keyboard_has_fc2_official_url_button():
+    keyboard = fc2._keyboard("4974501")
+    buttons = [b for row in keyboard.inline_keyboard for b in row]
+    assert any(b.callback_data == "fc2dl:4974501" for b in buttons)
+    assert any(b.callback_data == "fc2no:4974501" for b in buttons)
+    assert any(b.url == "https://adult.contents.fc2.com/article/4974501/" for b in buttons)
+
+
+def test_translate_failure_returns_empty(monkeypatch):
+    monkeypatch.setattr(fc2.requests, "get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert fc2._translate_ja_to_zh("可愛い", None) == ""
