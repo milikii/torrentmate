@@ -866,6 +866,7 @@ async def callbackDeleteTorrent(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def _fc2_store() -> Fc2Store:
+    """回调用一个新实例，状态以磁盘为准（不是和推送器共享同一个对象）。"""
     return Fc2Store()
 
 
@@ -930,7 +931,6 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     number = query.data.split(":", 1)[1]
     store = _fc2_store()
-    entry = store.entry(number) or {}
     # 删卡片要删到卡片实际在的地方：私聊优先，旧频道卡片走旧 channel_id
     channel_id = None
     for key in ("fc2.chat_id", "fc2.channel_id"):
@@ -940,14 +940,16 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
     if channel_id is None:
         channel_id = _super_user_id()
-    for message_id in entry.get("messages") or []:
+    # mute() 在同一把文件锁里读消息 id 并落盘 muted：既拿到当前已知的卡片/附图，
+    # 又保证推流端附图传完后的落盘不会把 muted 覆盖掉（Fc2Store 落盘前会重读并
+    # 合并磁盘 muted，推送器那个旧实例不会用旧内存把它抹掉）。
+    for message_id in store.mute(number):
         try:
             await context.bot.delete_message(
                 chat_id=channel_id, message_id=int(message_id)
             )
         except Exception as err:  # noqa: BLE001
             log.debug("删除 FC2 频道消息失败 %s: %s", message_id, err)
-    store.mute(number)
     await query.answer("已删除，以后不再推送")
 
 

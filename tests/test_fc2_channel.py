@@ -76,6 +76,8 @@ class FakeBot:
         self.groups = []
         self.markups = []
         self.messages = []
+        self.fail_groups = False
+        self.fail_photos = 0
         self._next_id = 100
 
     def _message(self):
@@ -83,10 +85,15 @@ class FakeBot:
         return SimpleNamespace(message_id=self._next_id)
 
     async def send_photo(self, **kwargs):
+        if self.fail_photos > 0:
+            self.fail_photos -= 1
+            raise RuntimeError("photo upload failed")
         self.photos.append(kwargs)
         return self._message()
 
     async def send_media_group(self, **kwargs):
+        if self.fail_groups:
+            raise RuntimeError("album upload failed")
         self.groups.append(kwargs)
         return [self._message() for _ in kwargs["media"]]
 
@@ -403,6 +410,360 @@ def test_magnet_assembly():
     assert "日本語" not in magnet
 
 
+async def test_card_send_failure_marks_retry_and_retries_next_poll(
+    tmp_path, monkeypatch
+):
+    # sol 的复现：last_ts=10，RSS 有 pub_ts=11 的条目，首次发卡片失败。
+    # 游标照推 11（失败条目单独记在 retry 里），下一轮靠 retry 重新推。
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    store.last_ts = 10
+    store.save()
+    entries = [
+        {
+            "title": "FC2-PPV-5000545 x",
+            "guid": "https://sukebei.nyaa.si/view/5000545",
+            "hash": "a" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        }
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    bot.fail_photos = 1
+    await pusher._poll_once(-1001234)
+
+    assert bot.photos == []
+    assert store.seen == {}
+    assert store.retry == {"5000545"}
+    assert store.last_ts == 11
+
+    await pusher._poll_once(-1001234)
+
+    assert len(bot.photos) == 1
+    assert bot.photos[0]["reply_markup"].inline_keyboard[0][0].callback_data == "fc2dl:5000545"
+    assert store.entry("5000545")["messages"]
+    assert store.retry == set()
+    assert store.last_ts == 11
+
+
+async def test_same_timestamp_failure_retried_after_cursor_moves(
+    tmp_path, monkeypatch
+):
+    # sol 复现：last_ts=10，A、B 都是 pub_ts=11；A 成功、B 封面发送失败。
+    # 游标被 A 推到 11 之后，B 不能再被 pub_ts > last_ts 过滤掉。
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    store.last_ts = 10
+    store.save()
+    entries = [
+        {
+            "title": "FC2-PPV-5000545 a",
+            "guid": "https://sukebei.nyaa.si/view/5000545",
+            "hash": "a" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        },
+        {
+            "title": "FC2-PPV-5000546 b",
+            "guid": "https://sukebei.nyaa.si/view/5000546",
+            "hash": "b" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        },
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    original_send_photo = bot.send_photo
+    fail = {"5000546": 1}
+
+    async def flaky_send_photo(**kwargs):
+        for number, count in fail.items():
+            if count and number in kwargs.get("caption", ""):
+                fail[number] = count - 1
+                raise RuntimeError("photo upload failed")
+        return await original_send_photo(**kwargs)
+
+    monkeypatch.setattr(bot, "send_photo", flaky_send_photo)
+
+    await pusher._poll_once(-1001234)
+
+    # A 出去了，B 失败、单独挂在 retry 上，游标已经到 11
+    assert store.entry("5000545") is not None
+    assert store.entry("5000546") is None
+    assert store.retry == {"5000546"}
+    assert store.last_ts == 11
+
+    # 重启重载后 retry 仍在磁盘上
+    reloaded = fc2.Fc2Store(str(store.path))
+    assert reloaded.retry == {"5000546"}
+
+    await pusher._poll_once(-1001234)
+
+    # 第二轮：B 补推成功，A 不重推
+    assert len(bot.photos) == 2
+    assert store.entry("5000546")["messages"]
+    assert store.retry == set()
+    assert store.last_ts == 11
+
+
+async def test_first_run_failure_not_swallowed_by_backfill(tmp_path, monkeypatch):
+    # sol 复现：空状态、backfill_limit=2；A(11) 封面发送失败、B(12) 成功，
+    # RSS 新增 C(13) 而 A 仍在 RSS 里。回补如果每轮重做，A 会被划进
+    # backlog 记成 seen，从没发出去的卡片永久丢失。
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch, backfill_limit=2)
+    entries = [
+        {
+            "title": "FC2-PPV-5000545 a",
+            "guid": "https://sukebei.nyaa.si/view/5000545",
+            "hash": "a" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        },
+        {
+            "title": "FC2-PPV-5000546 b",
+            "guid": "https://sukebei.nyaa.si/view/5000546",
+            "hash": "b" * 40,
+            "pub_ts": 12,
+            "size": "1 GiB",
+        },
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    original_send_photo = bot.send_photo
+    fail = {"5000545": 1}
+
+    async def flaky_send_photo(**kwargs):
+        for number, count in fail.items():
+            if count and number in kwargs.get("caption", ""):
+                fail[number] = count - 1
+                raise RuntimeError("photo upload failed")
+        return await original_send_photo(**kwargs)
+
+    monkeypatch.setattr(bot, "send_photo", flaky_send_photo)
+
+    await pusher._poll_once(-1001234)
+
+    assert store.entry("5000545") is None  # A 失败，绝不能被回补记成 seen
+    assert store.entry("5000546") is not None
+    assert store.retry == {"5000545"}
+    assert store.backfill_done is True
+
+    entries.append(
+        {
+            "title": "FC2-PPV-5000547 c",
+            "guid": "https://sukebei.nyaa.si/view/5000547",
+            "hash": "c" * 40,
+            "pub_ts": 13,
+            "size": "1 GiB",
+        }
+    )
+
+    await pusher._poll_once(-1001234)
+
+    # 第二轮：A 被重试推出去（不是被当 backlog 记 seen），C 也推了
+    assert store.entry("5000545")["messages"]
+    assert store.entry("5000547")["messages"]
+    assert store.retry == set()
+    assert store.last_ts == 13
+
+
+async def test_failed_entry_retried_without_blocking_later_entries(
+    tmp_path, monkeypatch
+):
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    store.last_ts = 10
+    store.save()
+    entries = [
+        {
+            "title": "FC2-PPV-5000546 bad",
+            "guid": "https://sukebei.nyaa.si/view/5000546",
+            "hash": "a" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        },
+        {
+            "title": "FC2-PPV-5000547 good",
+            "guid": "https://sukebei.nyaa.si/view/5000547",
+            "hash": "b" * 40,
+            "pub_ts": 12,
+            "size": "1 GiB",
+        },
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    original_send_photo = bot.send_photo
+
+    async def flaky_send_photo(**kwargs):
+        if "5000546" in kwargs.get("caption", ""):
+            raise RuntimeError("photo upload failed")
+        return await original_send_photo(**kwargs)
+
+    monkeypatch.setattr(bot, "send_photo", flaky_send_photo)
+
+    await pusher._poll_once(-1001234)
+
+    # 失败的那条不在 seen 里、挂在 retry 上；后面的条目照常推、游标照走
+    assert store.entry("5000546") is None
+    assert store.entry("5000547")["messages"]
+    assert store.retry == {"5000546"}
+    assert store.last_ts == 12
+
+    photos_after_first = len(bot.photos)
+    await pusher._poll_once(-1001234)
+
+    # 第二轮仍会重试失败条目（这次还是失败），已成功的条目不会重推
+    assert len(bot.photos) == photos_after_first
+    assert store.retry == {"5000546"}
+    assert store.last_ts == 12
+
+
+async def test_store_mute_returns_messages_and_forget_drops_entry(tmp_path):
+    store = fc2.Fc2Store(str(tmp_path / "fc2_state.json"))
+    store.remember(
+        "5000545", {"hash": "a" * 40, "title": "t", "pub_ts": 5}, messages=[7, 8]
+    )
+    store.save()
+
+    assert store.mute("5000545") == [7, 8]
+    assert store.mute("4999999") == []
+    assert {"5000545", "4999999"} <= store.muted
+
+    store.forget("5000545")
+    assert store.entry("5000545") is None
+    fresh = fc2.Fc2Store(str(store.path))
+    assert "5000545" in fresh.muted
+    assert fresh.entry("5000545") is None
+
+
+async def test_reload_after_failure_keeps_retry_entry(tmp_path, monkeypatch):
+    # 失败后重启进程：重试标记落在磁盘上，新实例照样认得这条
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    store.last_ts = 10
+    store.save()
+    entries = [
+        {
+            "title": "FC2-PPV-5000545 x",
+            "guid": "https://sukebei.nyaa.si/view/5000545",
+            "hash": "a" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        }
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    await pusher._poll_once(-1001234)
+    assert store.retry == {"5000545"}
+
+    reloaded = fc2.Fc2Store(str(store.path))
+    assert reloaded.retry == {"5000545"}
+    assert reloaded.seen == {}
+
+
+def test_finalize_keeps_muted_written_by_other_instance(tmp_path):
+    # 推送器和回调（真实运行时）是两个 store 实例：回调 new 一个实例写 muted，
+    # 推送器手里那个旧实例落盘时不能把 muted 用旧内存整份覆盖掉。
+    path = str(tmp_path / "fc2_state.json")
+    pusher_store = fc2.Fc2Store(path)
+    pusher_store.last_ts = 11
+    pusher_store.save()
+    pusher_store.remember(
+        "5000545", {"hash": "a" * 40, "title": "t", "pub_ts": 11}, messages=[2001]
+    )
+    pusher_store.save()
+
+    callback_store = fc2.Fc2Store(path)
+    assert callback_store.mute("5000545") == [2001]
+
+    assert (
+        pusher_store.finalize(
+            "5000545", {"hash": "a" * 40, "title": "t", "pub_ts": 11}, [2001, 2002]
+        )
+        is False
+    )
+    fresh = fc2.Fc2Store(path)
+    assert "5000545" in fresh.muted
+    assert fresh.entry("5000545")["messages"] == [2001]
+
+
+async def test_window_state_has_card_before_extras_and_finalize_keeps_muted(
+    tmp_path, monkeypatch
+):
+    # 封面成功即落盘（按钮期间可下载/可静音）；附图期间被 muted 则删图、
+    # 不记正常推送、muted 不被覆盖。
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        fc2,
+        "_preview_images",
+        lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"],
+    )
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1", b"2", b"3"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    async def slow_group(**kwargs):
+        started.set()
+        await gate.wait()
+        return [bot._message() for _ in kwargs["media"]]
+
+    monkeypatch.setattr(bot, "send_media_group", slow_group)
+    task = asyncio.create_task(
+        pusher._push_entry(
+            {
+                "title": "FC2-PPV-5000545 x",
+                "hash": "a" * 40,
+                "pub_ts": 11,
+                "guid": "https://sukebei.nyaa.si/view/1",
+            },
+            -1001234,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    # 窗口期：卡片已经在状态里，附图还挂着
+    card_id = 101
+    assert store.entry("5000545")["messages"] == [card_id]
+
+    store.mute("5000545")
+    gate.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    # 附图传完后：muted 保住，不记成正常推送
+    assert "5000545" in store.muted
+    assert store.entry("5000545") is None
+    fresh = fc2.Fc2Store(str(store.path))
+    assert "5000545" in fresh.muted
+    assert fresh.entry("5000545") is None
+
+
 async def test_run_without_channel_id_only_warns(tmp_path, monkeypatch, caplog):
     pusher, _store, _bot = make_pusher(tmp_path, monkeypatch, channel_id=None)
     calls = []
@@ -578,9 +939,75 @@ async def test_backfill_does_not_let_old_duplicate_block_new_push(tmp_path, monk
     assert store.last_ts == 1002
 
 
-async def test_media_group_gets_a_separate_button_message(tmp_path, monkeypatch):
+async def test_card_keyboard_rides_on_single_photo_not_album(tmp_path, monkeypatch):
+    # 媒体组客户端不渲染内联键盘（见 Fc2Channel._push_entry 注释），
+    # 所以按钮必须长在单张封面卡片上，其余图另发一个不带键盘的媒体组。
     pusher, store, bot = make_pusher(tmp_path, monkeypatch)
-    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg"])
+    monkeypatch.setattr(
+        fc2,
+        "_preview_images",
+        lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"],
+    )
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1", b"2", b"3"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+
+    await pusher._push_entry(
+        {"title": "FC2-PPV-5000545 x", "hash": "a" * 40, "pub_ts": 11, "guid": "https://sukebei.nyaa.si/view/1"},
+        -1001234,
+    )
+
+    # 卡片：单张封面 + caption + 键盘，客户端才会画按钮
+    assert len(bot.photos) == 1
+    card = bot.photos[0]
+    assert card["photo"] == b"1"
+    assert "<b>FC2-PPV-5000545</b>" in card["caption"]
+    assert card["parse_mode"] == fc2.ParseMode.HTML
+    kb = card["reply_markup"]
+    assert kb.inline_keyboard[0][0].callback_data == "fc2dl:5000545"
+    assert kb.inline_keyboard[0][1].callback_data == "fc2no:5000545"
+    assert kb.inline_keyboard[1][0].url == "https://adult.contents.fc2.com/article/5000545/"
+
+    # 其余预览图：独立媒体组，不带 caption / 键盘
+    assert len(bot.groups) == 1
+    media = bot.groups[0]["media"]
+    assert [item.media.input_file_content for item in media] == [b"2", b"3"]
+    assert all(item.caption is None for item in media)
+    assert "reply_markup" not in bot.groups[0]
+
+    # 不再往媒体组消息上 edit 键盘，也不发组外文字按钮消息
+    assert bot.markups == []
+    assert bot.messages == []
+    assert len(store.entry("5000545")["messages"]) == 3
+
+
+async def test_single_photo_card_carries_keyboard_without_album(tmp_path, monkeypatch):
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"only"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+
+    await pusher._push_entry(
+        {"title": "FC2-PPV-5000545 x", "hash": "a" * 40, "pub_ts": 11, "guid": "https://sukebei.nyaa.si/view/1"},
+        -1001234,
+    )
+
+    assert len(bot.photos) == 1
+    assert bot.photos[0]["reply_markup"].inline_keyboard[0][0].callback_data == "fc2dl:5000545"
+    assert bot.groups == []
+    assert bot.markups == []
+    assert len(store.entry("5000545")["messages"]) == 1
+
+
+async def test_two_photos_send_extra_as_single_photo_not_one_item_album(tmp_path, monkeypatch):
+    # 媒体组最少 2 张，附图只剩 1 张时不能塞进媒体组
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg"]
+    )
     monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1", b"2"])
     monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
     monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
@@ -591,12 +1018,35 @@ async def test_media_group_gets_a_separate_button_message(tmp_path, monkeypatch)
         -1001234,
     )
 
-    assert len(bot.groups) == 1
-    assert len(bot.messages) == 1
-    assert bot.messages[0]["text"] == "FC2-PPV-5000545"
-    kb = bot.messages[0]["reply_markup"]
-    assert kb.inline_keyboard[0][0].callback_data == "fc2dl:5000545"
-    assert kb.inline_keyboard[0][1].callback_data == "fc2no:5000545"
-    # 组内 2 张 + 按钮消息 1 条，都记进 state，删卡时一起删
-    assert len(store.entry("5000545")["messages"]) == 3
-    assert bot.markups == []
+    assert len(bot.photos) == 2
+    assert bot.photos[0]["photo"] == b"1"
+    assert bot.photos[0]["reply_markup"] is not None
+    assert bot.photos[1]["photo"] == b"2"
+    assert "reply_markup" not in bot.photos[1]
+    assert bot.groups == []
+    assert len(store.entry("5000545")["messages"]) == 2
+
+
+async def test_preview_album_failure_keeps_card_and_state(tmp_path, monkeypatch, caplog):
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    bot.fail_groups = True
+    monkeypatch.setattr(
+        fc2,
+        "_preview_images",
+        lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"],
+    )
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1", b"2", b"3"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+
+    with caplog.at_level(logging.WARNING):
+        await pusher._push_entry(
+            {"title": "FC2-PPV-5000545 x", "hash": "a" * 40, "pub_ts": 11, "guid": "https://sukebei.nyaa.si/view/1"},
+            -1001234,
+        )
+
+    # 卡片带按钮发出去了就不该因为附图失败丢掉状态（否则下一轮重推整张卡）
+    assert len(bot.photos) == 1
+    assert len(store.entry("5000545")["messages"]) == 1
+    assert any(record.levelno == logging.WARNING for record in caplog.records)

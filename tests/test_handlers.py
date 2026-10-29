@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 from hashlib import sha1
 from pathlib import Path
@@ -13,6 +14,7 @@ from lib import auth
 from lib.classifier import DEFAULT_RULES
 from lib.func import trans
 from lib.magnet import extract_magnets, parse_magnet
+from models import Fc2Channel as fc2
 from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue, QueueEntry
@@ -66,6 +68,8 @@ class FakeBot:
         self.sent = []
         self.edits = []
         self.deleted = []
+        self.photos = []
+        self.groups = []
         self.payload = b""
         self.downloads: list[Path] = []
 
@@ -76,6 +80,18 @@ class FakeBot:
     async def send_message(self, **kwargs):
         self.sent.append(kwargs)
         return SimpleNamespace(message_id=1000 + len(self.sent))
+
+    async def send_photo(self, **kwargs):
+        self.photos.append(kwargs)
+        return SimpleNamespace(message_id=2000 + len(self.photos))
+
+    async def send_media_group(self, **kwargs):
+        self.groups.append(kwargs)
+        start = 3000 + 10 * len(self.groups)
+        return [
+            SimpleNamespace(message_id=start + index)
+            for index in range(len(kwargs["media"]))
+        ]
 
     async def edit_message_text(self, **kwargs):
         self.edits.append(kwargs)
@@ -765,6 +781,117 @@ async def test_fc2_callbacks_ignore_other_users(
     assert env.bot.sent == []
     assert env.bot.edits == []
     assert store.muted == set()
+
+
+# ---------------------------------------------------------------- BLOCK 2 窗口期
+
+FC2_ENTRY = {
+    "title": "FC2-PPV-5000545 x",
+    "guid": "https://sukebei.nyaa.si/view/5000545",
+    "hash": FC2_HASH,
+    "pub_ts": 11,
+    "size": "1 GiB",
+}
+
+
+class Fc2PusherConfig:
+    """推送器只需 fc2.proxy / fc2.verify_tls，取不到就走默认值。"""
+
+    def get(self, path, default=None):
+        return default
+
+
+def install_fc2_media(monkeypatch):
+    monkeypatch.setattr(
+        fc2,
+        "_preview_images",
+        lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"],
+    )
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1", b"2", b"3"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+
+
+def gated_album(env, monkeypatch):
+    """附图上传卡在闸门上，模拟「封面已发、附图还在传」的窗口期。"""
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    async def slow_group(**kwargs):
+        started.set()
+        await gate.wait()
+        return [
+            SimpleNamespace(message_id=900 + index)
+            for index in range(len(kwargs["media"]))
+        ]
+
+    monkeypatch.setattr(env.bot, "send_media_group", slow_group)
+    return gate, started
+
+
+async def test_fc2_download_works_while_preview_upload_in_flight(
+    env, tmp_path, monkeypatch
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    install_fc2_media(monkeypatch)
+    gate, started = gated_album(env, monkeypatch)
+    pusher = fc2.Fc2Pusher(env.bot, Fc2PusherConfig(), store)
+
+    task = asyncio.create_task(pusher._push_entry(dict(FC2_ENTRY), -1001234))
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    # 窗口期：卡片已经落盘，按钮已出现
+    assert store.entry("5000545")["messages"] == [2001]
+
+    update, answers = make_fc2_callback("fc2dl:5000545")
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == ["已开始下载"]
+    assert len(env.client.added) == 1
+    assert env.client.added[0]["torrent"].startswith(f"magnet:?xt=urn:btih:{FC2_HASH}")
+
+    gate.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert len(store.entry("5000545")["messages"]) == 3
+
+
+async def test_fc2_mute_via_real_callback_store_during_window(
+    env, tmp_path, monkeypatch
+):
+    # sol 复现的真实路径：推送器持有一个 Fc2Store，回调 _fc2_store() 自己新建
+    # 另一个，两者不是同一个对象、各有一份内存。这里刻意不 monkeypatch
+    # Fc2Store，用真实路径跑「附图上传中 -> 真实回调 mute -> 放行附图」。
+    monkeypatch.setattr(fc2, "CONFIG_FILE", str(tmp_path / "torrentino.yaml"))
+    install_fc2_media(monkeypatch)
+    gate, started = gated_album(env, monkeypatch)
+    pusher_store = fc2.Fc2Store()
+    pusher = fc2.Fc2Pusher(env.bot, Fc2PusherConfig(), pusher_store)
+
+    task = asyncio.create_task(pusher._push_entry(dict(FC2_ENTRY), -1001234))
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    # 回调真实新建的 store：和推送器手里那个不是同一个实例
+    callback_store = handlers._fc2_store()
+    assert callback_store is not pusher_store
+    assert callback_store.path == pusher_store.path
+    assert callback_store.entry("5000545")["messages"] == [2001]
+
+    update, answers = make_fc2_callback("fc2no:5000545")
+    await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == ["已删除，以后不再推送"]
+    assert env.bot.deleted == [(-1001234, 2001)]
+
+    gate.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    # 附图传完后：磁盘 muted 不被旧内存覆盖，不记正常推送，封面与附图都被删
+    fresh = fc2.Fc2Store()
+    assert "5000545" in fresh.muted
+    assert fresh.entry("5000545") is None
+    for message_id in (2001, 900, 901):
+        assert (-1001234, message_id) in env.bot.deleted
 
 
 async def test_fc2_history_commands_only_list_fc2(env):

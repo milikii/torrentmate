@@ -459,17 +459,41 @@ def _keyboard(number: str) -> InlineKeyboardMarkup:
     )
 
 
+def _shared_path_lock(path: str) -> threading.RLock:
+    """同一个状态文件在进程内共用一把锁。"""
+    with Fc2Store._locks_guard:
+        lock = Fc2Store._locks.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            Fc2Store._locks[path] = lock
+        return lock
+
+
 class Fc2Store:
-    """单用户 FC2 状态文件：last_ts + seen + muted。"""
+    """单用户 FC2 状态文件：last_ts + seen + muted + retry + backfill_done。
+
+    retry 是「发失败、下轮必须重试」的编号集合：同秒多条（批量上架）时
+    光靠时间游标会把失败的那条永久漏推，所以失败的条目单独记下来，
+    下一轮不看游标也要重试。backfill_done 保证首轮回补只做一次。
+
+    推送器和回调（fc2dl / fc2no）真实运行时是两个实例，各自一份内存，
+    所以同一路径共用一把锁；并且每次落盘前都先把磁盘上的 muted 并回来，
+    绝不能用旧内存整份覆盖（否则附图传完后的落盘会把刚点的「不感兴趣」抹掉）。
+    """
+
+    _locks: dict[str, threading.RLock] = {}
+    _locks_guard = threading.Lock()
 
     def __init__(self, path: str | None = None) -> None:
-        self.path = path or os.path.join(
-            os.path.dirname(CONFIG_FILE), "fc2_state.json"
+        self.path = os.path.abspath(
+            path or os.path.join(os.path.dirname(CONFIG_FILE), "fc2_state.json")
         )
-        self._lock = threading.RLock()
+        self._lock = _shared_path_lock(self.path)
         self.last_ts = 0.0
         self.seen: dict[str, dict] = {}
         self.muted: set[str] = set()
+        self.retry: set[str] = set()
+        self.backfill_done = False
         self.load()
 
     def load(self) -> None:
@@ -477,6 +501,8 @@ class Fc2Store:
             self.last_ts = 0.0
             self.seen = {}
             self.muted = set()
+            self.retry = set()
+            self.backfill_done = False
             if not os.path.isfile(self.path):
                 return
             try:
@@ -487,15 +513,34 @@ class Fc2Store:
                     str(key): value for key, value in (data.get("seen") or {}).items()
                 }
                 self.muted = {str(item) for item in (data.get("muted") or [])}
+                self.retry = {str(item) for item in (data.get("retry") or [])}
+                self.backfill_done = bool(data.get("backfill_done"))
             except Exception as err:  # noqa: BLE001
                 log.warning("FC2 状态文件损坏，按空状态继续 %s: %s", self.path, err)
                 self.last_ts, self.seen, self.muted = 0.0, {}, set()
+                self.retry, self.backfill_done = set(), False
+
+    def _disk_state(self) -> dict:
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _merge_disk_muted(self) -> None:
+        """落盘前把磁盘上已有的 muted 并进内存，避免用旧内存覆盖掉它。"""
+        for item in self._disk_state().get("muted") or []:
+            self.muted.add(str(item))
 
     def _write(self) -> None:
+        self._merge_disk_muted()
         data = {
             "last_ts": self.last_ts,
             "seen": self.seen,
             "muted": sorted(self.muted),
+            "retry": sorted(self.retry),
+            "backfill_done": self.backfill_done,
         }
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -516,19 +561,78 @@ class Fc2Store:
         with self._lock:
             return self.seen.get(str(number))
 
+    def _record(self, number: str, entry: dict, messages=None) -> None:
+        self.seen[str(number)] = {
+            "hash": entry.get("hash") or "",
+            "title": entry.get("title") or "",
+            "pub_ts": float(entry.get("pub_ts") or 0),
+            "messages": list(messages or []),
+        }
+        self.retry.discard(str(number))
+
+    def mark_retry(self, number: str) -> None:
+        """记下一条发不出去的条目：下轮不看时间游标也要重试。"""
+        key = str(number)
+        with self._lock:
+            self.retry.add(key)
+            self._write()
+
+    def clear_retry(self, numbers) -> None:
+        """撤掉重试标记（成功了，或这条已经从 RSS 里消失、没法再推）。"""
+        drop = {str(item) for item in numbers}
+        with self._lock:
+            if self.retry & drop:
+                self.retry -= drop
+                self._write()
+
     def remember(self, number: str, entry: dict, messages=None) -> None:
         with self._lock:
-            self.seen[str(number)] = {
-                "hash": entry.get("hash") or "",
-                "title": entry.get("title") or "",
-                "pub_ts": float(entry.get("pub_ts") or 0),
-                "messages": list(messages or []),
-            }
+            self._record(number, entry, messages)
 
-    def mute(self, number: str) -> None:
+    def finalize(self, number: str, entry: dict, messages) -> bool:
+        """附图传完后的收尾：附图期间被 muted 就不写正常状态，返回 False。"""
         with self._lock:
-            self.muted.add(str(number))
+            self._merge_disk_muted()
+            if str(number) in self.muted:
+                return False
+            self._record(number, entry, messages)
             self._write()
+            return True
+
+    def forget(self, number: str) -> None:
+        """撤掉一条 seen 记录（附图期间被 muted 的条目不能算正常推送）。"""
+        with self._lock:
+            existed = self.seen.pop(str(number), None) is not None
+            if str(number) in self.retry:
+                self.retry.discard(str(number))
+                existed = True
+            if existed:
+                self._write()
+
+    def mute(self, number: str) -> list[int]:
+        """记 muted，同时返回当前已知的消息 id。
+
+        读 seen 和写 muted 在同一把锁里：附图上传期间点「不感兴趣」时，
+        推流端随后落盘不会把 muted 覆盖掉，也不会漏删卡片。
+        """
+        key = str(number)
+        with self._lock:
+            self._merge_disk_muted()
+            self.muted.add(key)
+            self.retry.discard(key)
+            record = self.seen.get(key) or {}
+            if not record:
+                # 推送器用的是另一个实例，卡片 id 只可能在磁盘上
+                disk_seen = self._disk_state().get("seen") or {}
+                record = disk_seen.get(key) or {}
+            messages = []
+            for value in record.get("messages") or []:
+                try:
+                    messages.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            self._write()
+            return messages
 
 
 class Fc2Pusher:
@@ -582,16 +686,30 @@ class Fc2Pusher:
         entries = await asyncio.to_thread(_fetch_entries, self._proxy())
         if not entries:
             return
-        incremental = [
-            entry
-            for entry in entries
-            if float(entry["pub_ts"]) > float(self.store.last_ts or 0)
-        ]
+        last_ts = float(self.store.last_ts or 0)
+        # 增量 = 比游标新的条目 + 之前发失败的条目。失败重试不看游标：
+        # 同秒多条（批量上架）时游标会越过失败那条，只按时间戳过滤就永久漏推。
+        incremental: list[dict] = []
+        position: dict[str, int] = {}
+        for entry in entries:
+            number = extract_number(entry["title"])
+            in_retry = bool(number) and number in self.store.retry
+            if float(entry["pub_ts"]) <= last_ts and not in_retry:
+                continue
+            if number and number in position:
+                # 同一个 FC2 编号在 RSS 里出现两次时只留新的那条
+                incremental[position[number]] = entry
+                continue
+            if number:
+                position[number] = len(incremental)
+            incremental.append(entry)
         if not incremental:
+            self._prune_retry(entries)
             return
-        newest = max(float(entry["pub_ts"]) for entry in incremental)
+        incremental.sort(key=lambda item: float(item["pub_ts"]))
+        newest = max(float(entry["pub_ts"]) for entry in entries)
 
-        if not self.store.last_ts:
+        if not self.store.backfill_done:
             limit = max(int(self._setting("backfill_limit", DEFAULT_BACKFILL) or 0), 0)
             backlog, incremental = (
                 (incremental[:-limit], incremental[-limit:])
@@ -604,7 +722,6 @@ class Fc2Pusher:
             pushed_numbers = {
                 extract_number(entry["title"]) for entry in incremental
             }
-            changed = False
             for entry in backlog:
                 number = extract_number(entry["title"])
                 if (
@@ -613,32 +730,64 @@ class Fc2Pusher:
                     and number not in pushed_numbers
                 ):
                     self.store.remember(number, entry)
-                    changed = True
-            if changed:
-                self.store.save()
+            # 回补只做一次，不能拿 last_ts == 0 当条件：首轮条目全发失败时
+            # 游标会停在 0，下一轮又把老条目划进 backlog 记成 seen，从没发出
+            # 去的卡片就此永久丢失（sol 复现）。
+            self.store.backfill_done = True
+            self.store.save()
 
-        for index, entry in enumerate(incremental):
-            await self._push_entry(entry, channel_id)
-            if index < len(incremental) - 1:
-                await asyncio.sleep(PUSH_DELAY)
+        cursor = last_ts
+        for entry in incremental:
+            pub_ts = float(entry["pub_ts"])
+            number = extract_number(entry["title"])
+            if number and (number in self.store.muted or number in self.store.seen):
+                # 已推过 / 已静音的条目直接跳过，不白等 PUSH_DELAY。
+                if number in self.store.retry:
+                    self.store.clear_retry([number])
+                cursor = max(cursor, pub_ts)
+                continue
+            if not await self._push_entry(entry, channel_id):
+                log.warning(
+                    "FC2 条目推送失败，已记入重试列表，下轮继续: %s",
+                    entry.get("title"),
+                )
+            cursor = max(cursor, pub_ts)
+            await asyncio.sleep(PUSH_DELAY)
 
-        self.store.last_ts = newest
+        # 游标可以放心推到最新：失败条目由 retry 列表兑现，不靠游标兑。
+        self.store.last_ts = max(cursor, newest)
+        self._prune_retry(entries)
         self.store.save()
 
-    async def _push_entry(self, entry: dict, channel_id) -> None:
+    def _prune_retry(self, entries: list[dict]) -> None:
+        """已经从 RSS 里消失、或已静音/已推过的失败条目不再挂着无限重试。"""
+        live = {extract_number(entry["title"]) for entry in entries}
+        self.store.clear_retry(
+            [
+                number
+                for number in self.store.retry
+                if number not in live
+                or number in self.store.muted
+                or number in self.store.seen
+            ]
+        )
+
+    async def _push_entry(self, entry: dict, channel_id) -> bool:
+        """推一条卡片，返回这条是否已经处理完（False 表示失败、下轮要重试）。"""
         number = extract_number(entry["title"])
         if not number:
             log.debug("标题里没有 FC2 编号，跳过: %s", entry["title"])
-            return
+            return True
         if number in self.store.muted or number in self.store.seen:
-            return
+            return True
 
         proxy = self._proxy()
         verify_tls = bool(self._setting("verify_tls", True))
         images = await asyncio.to_thread(_preview_images, number, proxy, verify_tls)
         if not images:
-            log.debug("FC2 官网未确认编号 %s，跳过", number)
-            return
+            log.debug("FC2 官网未确认编号 %s，记入重试", number)
+            self.store.mark_retry(number)
+            return False
         # nyaa 附图放官网图后面，最多补到媒体组上限 10 张
         detail_images = await asyncio.to_thread(
             _nyaa_detail_images, entry.get("guid"), proxy, verify_tls
@@ -649,65 +798,84 @@ class Fc2Pusher:
             _append_unique(images, url)
         photos = await asyncio.to_thread(_download_images, images, proxy, verify_tls)
         if not photos:
-            log.debug("FC2 编号 %s 没有可用图片，跳过", number)
-            return
+            log.debug("FC2 编号 %s 没有可用图片，记入重试", number)
+            self.store.mark_retry(number)
+            return False
 
         tags, description_ja = _fetch_official_detail(number, proxy, verify_tls)
         censor = _censor_label(tags)
         detail_zh = _translate_ja_to_zh(description_ja, proxy) if description_ja else ""
         caption = _caption(entry, number, censor_label=censor, detail=detail_zh or description_ja)
         keyboard = _keyboard(number)
+        # 卡片本体必须是「单张图片 + caption + 键盘」这种普通媒体消息。
+        # 媒体组（album）客户端一律不渲染内联键盘：Bot API 负责人在
+        # tdlib/telegram-bot-api#86 里明确写了 "Clients are unable to show
+        # inline keyboards for albums"；Telegram Android 源码里也是同一个
+        # 条件（ChatMessageCell：只有 currentPosition == null 即非相册，或
+        # 相册为文件相册且位于最后一条时才画 bot 键盘），所以键盘挂组首、
+        # 组尾、全组都没用。改成封面单独发一条（按钮就长在这张图片卡片
+        # 上），其余预览图另发一个不带 caption / 键盘的媒体组。
+        # 媒体组走 NAS 7890 代理上传 6-10 张图时，PTB 默认 20 秒写超时很容易
+        # 误报 Timed out（服务端其实已收到，像 4973177 那次），放宽到 120 秒。
         try:
-            # 媒体组走 NAS 7890 代理上传 6-10 张图时，PTB 默认 20 秒写超时很容易
-            # 误报 Timed out（服务端其实已收到，像 4973177 那次），放宽到 120 秒。
-            if len(photos) == 1:
-                sent = [
-                    await self.bot.send_photo(
-                        chat_id=channel_id,
-                        photo=photos[0],
-                        caption=caption,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=keyboard,
-                        read_timeout=120,
-                        write_timeout=120,
-                        connect_timeout=30,
-                    )
-                ]
-            else:
-                media = [
-                    InputMediaPhoto(
-                        photo,
-                        caption=caption if index == 0 else None,
-                        parse_mode=ParseMode.HTML if index == 0 else None,
-                    )
-                    for index, photo in enumerate(photos)
-                ]
-                sent = list(
-                    await self.bot.send_media_group(
-                        chat_id=channel_id,
-                        media=media,
-                        read_timeout=120,
-                        write_timeout=120,
-                        connect_timeout=30,
-                    )
-                )
-                # 媒体组按钮实测教训：服务端说键盘已挂在组上（再挂一次会报
-                # not modified），但用户 Android 客户端就是不渲染组内按钮。
-                # 所以组内不再依赖 edit 挂按钮，改在组下面单独发一条带按钮
-                # 的文字消息——单条文字消息的键盘所有客户端都正常显示。
-                # 这条消息也要记进 state，点「不感兴趣」删卡时一起删掉。
-                if sent:
-                    button_msg = await self.bot.send_message(
-                        chat_id=channel_id,
-                        text=f"FC2-PPV-{number}",
-                        reply_markup=keyboard,
-                    )
-                    sent.append(button_msg)
+            card = await self.bot.send_photo(
+                chat_id=channel_id,
+                photo=photos[0],
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+            )
         except Exception as err:  # noqa: BLE001
-            log.error("FC2 频道推送失败 %s: %s", number, err)
-            return
+            log.error("FC2 卡片发送失败 %s: %s", number, err)
+            self.store.mark_retry(number)
+            return False
 
-        self.store.remember(
-            number, entry, messages=[message.message_id for message in sent]
-        )
+        # 封面一发成功、按钮一出现，状态里就必须有这条：下载和不感兴趣两个
+        # 按钮要在附图上传期间就能正常工作，不能等附图传完才记。
+        sent_ids = [card.message_id]
+        self.store.remember(number, entry, messages=sent_ids)
         self.store.save()
+
+        extras = photos[1:]
+        if extras:
+            try:
+                if len(extras) == 1:
+                    # 媒体组最少 2 张，只剩 1 张附图时按普通图片发。
+                    extra = await self.bot.send_photo(
+                        chat_id=channel_id,
+                        photo=extras[0],
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30,
+                    )
+                    sent_ids.append(extra.message_id)
+                else:
+                    sent_ids.extend(
+                        message.message_id
+                        for message in await self.bot.send_media_group(
+                            chat_id=channel_id,
+                            media=[InputMediaPhoto(photo) for photo in extras],
+                            read_timeout=120,
+                            write_timeout=120,
+                            connect_timeout=30,
+                        )
+                    )
+            except Exception as err:  # noqa: BLE001
+                # 附图只是预览，发失败不影响卡片和按钮；状态照记，避免下一轮重推整张卡。
+                log.warning("FC2 预览图发送失败 %s: %s", number, err)
+
+        if not self.store.finalize(number, entry, sent_ids):
+            # 附图上传期间用户点了「不感兴趣」：删掉自己发的图，保持 muted，
+            # 不记成正常推送，也不许把 muted 覆盖回去。
+            for message_id in sent_ids:
+                try:
+                    await self.bot.delete_message(
+                        chat_id=channel_id, message_id=int(message_id)
+                    )
+                except Exception as err:  # noqa: BLE001
+                    log.debug("撤回 muted 卡片消息失败 %s: %s", message_id, err)
+            self.store.forget(number)
+        return True
