@@ -40,6 +40,7 @@ from models.BotConfigurator import BotConfigurator
 from models.Browser import Browser
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue
+from models.Fc2Channel import Fc2Store, extract_number, _magnet
 from models.HistoryBrowser import HistoryBrowser
 from models.PostsBrowser import PostsBrowser
 from models.SearchTorrents import SearchTorrents
@@ -861,6 +862,135 @@ async def callbackDeleteTorrent(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+# ---------------------------------------------------------------- FC2 频道
+
+
+def _fc2_store() -> Fc2Store:
+    return Fc2Store()
+
+
+def _fc2_records() -> list[dict]:
+    """从现有下载历史里挑出 FC2 记录，按完成时间倒序。"""
+    records = []
+    for record in DownloadHistory.show():
+        name = str(record.get("name") or "")
+        number = extract_number(name)
+        if not number:
+            continue
+        records.append(
+            {
+                "number": number,
+                "name": name,
+                "date": str(record.get("date_done") or ""),
+                "dir": str(record.get("download_dir") or ""),
+            }
+        )
+    records.sort(key=lambda item: item["date"], reverse=True)
+    return records
+
+
+async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """频道卡片「下载」：现场拼 nyaa 磁力，走现有单条添加流程。"""
+    query = update.callback_query
+    if query.from_user.id != _super_user_id():
+        await query.answer()
+        return
+    number = query.data.split(":", 1)[1]
+    entry = _fc2_store().entry(number)
+    if not entry:
+        await query.answer("这条已过期")
+        return
+    # 极简：进度卡片由 DownloadMonitor 发到私聊，频道卡片不动。
+    try:
+        await asyncio.to_thread(
+            get_torrent_connection().add_torrent,
+            chat_id=query.from_user.id,
+            lang_code="zh",
+            torrent=_magnet(entry.get("hash"), entry.get("title")),
+            download_dir=None,
+            title=entry.get("title"),
+            auto_classify=True,
+            single_dedup=True,
+        )
+    except TorrentAlreadyExists:
+        await query.answer("已经下过了")
+        return
+    except Exception as err:  # noqa: BLE001
+        log.error("FC2 下载添加失败 %s: %s", number, err)
+        await query.answer("添加失败")
+        return
+    await query.answer("已开始下载")
+
+
+async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """频道卡片「不感兴趣」：删掉整条卡片并以后不再推。"""
+    query = update.callback_query
+    if query.from_user.id != _super_user_id():
+        await query.answer()
+        return
+    number = query.data.split(":", 1)[1]
+    store = _fc2_store()
+    entry = store.entry(number) or {}
+    channel_id = bot_config.get("fc2.channel_id")
+    for message_id in entry.get("messages") or []:
+        try:
+            await context.bot.delete_message(
+                chat_id=channel_id, message_id=int(message_id)
+            )
+        except Exception as err:  # noqa: BLE001
+            log.debug("删除 FC2 频道消息失败 %s: %s", message_id, err)
+    store.mute(number)
+    await query.answer("已删除，以后不再推送")
+
+
+@restricted
+async def fc2list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    records = _fc2_records()[:30]
+    if not records:
+        await context.bot.send_message(
+            chat_id=update.message.chat.id, text="还没有 FC2 下载记录"
+        )
+        return
+    lines = ["<b>FC2 下载记录</b>", ""]
+    for item in records:
+        lines.append(
+            f"FC2-PPV-{item['number']}  {escape_html(_truncate(item['name'], 40))}\n"
+            f"  {escape_html(item['date'])}  <code>{escape_html(item['dir'])}</code>"
+        )
+    await context.bot.send_message(
+        chat_id=update.message.chat.id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@restricted
+async def fc2info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = " ".join(context.args or []).strip()
+    number = extract_number(raw) or (str(int(raw)) if raw.isdigit() else None)
+    chat_id = update.message.chat.id
+    if not number:
+        await context.bot.send_message(chat_id=chat_id, text="用法：/fc2 <FC2 编号>")
+        return
+    records = [item for item in _fc2_records() if item["number"] == number]
+    if not records:
+        await context.bot.send_message(chat_id=chat_id, text="没有这个编号的下载记录")
+        return
+    lines = [f"<b>FC2-PPV-{number}</b>", ""]
+    for item in records:
+        lines.append(
+            f"{escape_html(item['date'])}  {escape_html(_truncate(item['name'], 40))}\n"
+            f"  <code>{escape_html(item['dir'])}</code>"
+        )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 # ---------------------------------------------------------------- 状态 / 限速 / 规则
 
 
@@ -1074,6 +1204,9 @@ HANDLERS = [
     CommandHandler("rules", rules_command),
     CommandHandler("classify", classify_command),
     CommandHandler("speed", speed_command),
+    # FC2 频道：记录查询
+    CommandHandler("fc2list", fc2list_command),
+    CommandHandler("fc2", fc2info_command),
     # 底部键盘按钮（多语言文案）
     MessageHandler(Regex(button_regex("menu.torrents")), torrentList),
     MessageHandler(Regex(button_regex("menu.search")), lastSearchResults),
@@ -1106,6 +1239,9 @@ HANDLERS = [
         | Document.FileExtension("torrent"),
         chooseDownloadDir,
     ),
+    # FC2 频道卡片的按钮（必须在下方分页与兜底之前）
+    CallbackQueryHandler(fc2_download, pattern=r"^fc2dl:\d+$"),
+    CallbackQueryHandler(fc2_mute, pattern=r"^fc2no:\d+$"),
     # 导航按钮（分页）
     CallbackQueryHandler(getMenuPage, pattern=r"^[x0-9]+$"),
     # 完成通知里的按钮

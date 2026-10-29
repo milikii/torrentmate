@@ -14,6 +14,7 @@ from lib.classifier import DEFAULT_RULES
 from lib.func import trans
 from lib.magnet import extract_magnets, parse_magnet
 from models.BotConfigurator import BotConfigurator
+from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue, QueueEntry
 from models.TransmissionClient import TransmissionClient
 
@@ -64,8 +65,13 @@ class FakeBot:
     def __init__(self):
         self.sent = []
         self.edits = []
+        self.deleted = []
         self.payload = b""
         self.downloads: list[Path] = []
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
 
     async def send_message(self, **kwargs):
         self.sent.append(kwargs)
@@ -172,6 +178,7 @@ def env(tmp_path, monkeypatch):
                     "rules": DEFAULT_RULES,
                 },
                 "notify": {"progress": True},
+                "fc2": {"channel_id": -1001234},
                 "trackers": {"rutracker": {"base_url": "https://rutracker.invalid"}},
             },
             allow_unicode=True,
@@ -180,7 +187,9 @@ def env(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     original_file = BotConfigurator.config_file
+    original_history_file = DownloadHistory.download_log_file
     BotConfigurator.config_file = str(path)
+    DownloadHistory.set_log_file(str(tmp_path / "download.log"))
     handlers.bot_config._config = None
     auth.bot_config._config = None
     DownloadQueue.set_state_file(None)
@@ -190,6 +199,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(handlers, "get_torrent_connection", lambda: client)
     yield SimpleNamespace(client=client, bot=FakeBot())
     BotConfigurator.config_file = original_file
+    DownloadHistory.set_log_file(original_history_file)
     handlers.bot_config._config = None
     auth.bot_config._config = None
     DownloadQueue.clear()
@@ -623,3 +633,168 @@ async def test_single_add_error_cleans_temp_without_queue_entry(
     assert DownloadQueue.size() == 0
     assert not env.bot.downloads[-1].exists()
     assert "transmission is down" in env.bot.sent[0]["text"]
+
+
+# ---------------------------------------------------------------- FC2 频道
+
+
+FC2_HASH = "d00c0ffee" * 4
+
+
+def install_fc2_store(monkeypatch, tmp_path):
+    store = handlers.Fc2Store(str(tmp_path / "fc2_state.json"))
+    monkeypatch.setattr(handlers, "Fc2Store", lambda: store)
+    return store
+
+
+def make_fc2_callback(data, user_id=9):
+    answers = []
+
+    async def answer(text=None, *args, **kwargs):
+        answers.append(text)
+
+    query = SimpleNamespace(
+        data=data,
+        from_user=SimpleNamespace(id=user_id, language_code="zh-hans"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=user_id), message_id=77),
+        answer=answer,
+        edit_message_reply_markup=_async_noop,
+    )
+    return (
+        SimpleNamespace(
+            callback_query=query, effective_user=query.from_user, message=None
+        ),
+        answers,
+    )
+
+
+def make_command_update(args):
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=9),
+        from_user=SimpleNamespace(id=9, language_code="zh-hans"),
+    )
+    return SimpleNamespace(
+        message=message, effective_user=message.from_user, callback_query=None
+    ), SimpleNamespace(args=args, bot=None, user_data={})
+
+
+async def test_fc2_download_adds_magnet_to_private_chat(env, tmp_path, monkeypatch):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    update, answers = make_fc2_callback("fc2dl:5000545")
+    context = SimpleNamespace(user_data={}, bot=env.bot)
+
+    await handlers.fc2_download(update, context)
+
+    assert len(env.client.added) == 1
+    call = env.client.added[0]
+    assert call["single_dedup"] is True
+    assert call["chat_id"] == 9
+    assert call["torrent"].startswith(f"magnet:?xt=urn:btih:{FC2_HASH}")
+    assert call["title"] == "FC2-PPV-5000545 sample"
+    assert env.bot.edits == []
+    assert env.bot.sent == []
+    assert answers == ["已开始下载"]
+
+
+async def test_fc2_download_reports_duplicate_without_card(env, tmp_path, monkeypatch):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+
+    def duplicate(**kwargs):
+        raise handlers.TorrentAlreadyExists(FC2_HASH)
+
+    monkeypatch.setattr(env.client, "add_torrent", duplicate)
+    update, answers = make_fc2_callback("fc2dl:5000545")
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == ["已经下过了"]
+    assert env.bot.sent == []
+    assert env.bot.edits == []
+
+
+async def test_fc2_mute_deletes_all_cards_and_persists(env, tmp_path, monkeypatch):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[123, 124, 125],
+    )
+    update, answers = make_fc2_callback("fc2no:5000545")
+
+    await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert env.bot.deleted == [
+        (-1001234, 123),
+        (-1001234, 124),
+        (-1001234, 125),
+    ]
+    assert "5000545" in store.muted
+    fresh = type(store)(str(store.path))
+    assert "5000545" in fresh.muted
+    assert answers == ["已删除，以后不再推送"]
+
+
+@pytest.mark.parametrize("data", ["fc2dl:5000545", "fc2no:5000545"])
+async def test_fc2_callbacks_ignore_other_users(
+    env, tmp_path, monkeypatch, data
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[123],
+    )
+    update, answers = make_fc2_callback(data, user_id=42)
+    handler = handlers.fc2_download if data.startswith("fc2dl") else handlers.fc2_mute
+
+    await handler(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == [None]
+    assert env.client.added == []
+    assert env.bot.deleted == []
+    assert env.bot.sent == []
+    assert env.bot.edits == []
+    assert store.muted == set()
+
+
+async def test_fc2_history_commands_only_list_fc2(env):
+    records = [
+        ("2026-10-28 10:00:00", "FC2-PPV-5000545 sample", "/downloads/FC2"),
+        ("2026-10-29 10:00:00", "SSIS-123 movie", "/downloads/有码"),
+        ("2026-10-27 10:00:00", "fc2ppv 1234567 other", "/downloads/FC2"),
+    ]
+    for date_done, name, directory in records:
+        DownloadHistory.add(date_done, name, directory, 100)
+
+    update, context = make_command_update([])
+    context.bot = env.bot
+    await handlers.fc2list_command(update, context)
+
+    text = env.bot.sent[-1]["text"]
+    assert "FC2-PPV-5000545" in text
+    assert "FC2-PPV-1234567" in text
+    assert "SSIS-123" not in text
+
+    update, context = make_command_update(["5000545"])
+    context.bot = env.bot
+    await handlers.fc2info_command(update, context)
+
+    text = env.bot.sent[-1]["text"]
+    assert "FC2-PPV-5000545" in text
+    assert "FC2-PPV-1234567" not in text
+
+    update, context = make_command_update(["9999999"])
+    context.bot = env.bot
+    await handlers.fc2info_command(update, context)
+
+    assert env.bot.sent[-1]["text"] == "没有这个编号的下载记录"

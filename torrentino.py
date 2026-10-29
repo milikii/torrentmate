@@ -17,6 +17,7 @@ from telegram.error import InvalidToken
 from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue
+from models.Fc2Channel import Fc2Pusher
 
 from lib.constants import BOT_FOLDER, CONFIG_FILE
 from lib.func import get_logger
@@ -48,21 +49,27 @@ def bot():
     """Start the bot."""
     try:
         monitor_task = None
+        fc2_task = None
 
         async def post_init(application):
-            nonlocal monitor_task
+            nonlocal monitor_task, fc2_task
             await application.bot.set_my_commands(commands)
             client = get_torrent_connection()
             monitor_task = application.create_task(
                 client.monitor_downloads(application.bot),
                 name="transmission-download-monitor",
             )
+            fc2_task = application.create_task(
+                Fc2Pusher(application.bot).run(),
+                name="fc2-channel-poller",
+            )
 
         async def post_shutdown(_application):
-            if monitor_task is not None:
-                monitor_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await monitor_task
+            for task in (monitor_task, fc2_task):
+                if task is not None:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
 
         app = (
             Application.builder()

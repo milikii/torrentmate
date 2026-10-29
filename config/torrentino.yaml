@@ -1,0 +1,132 @@
+bot:
+  # Telegram 机器人 token，找 @BotFather 申请
+  token: "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+  # 管理员（超级用户）的数字 ID，必填，也可以用环境变量 SUPER_USER 传入
+  # 获取方式：给机器人发任意消息，然后访问
+  # https://api.telegram.org/bot<TOKEN>/getUpdates 查看 message.from.id
+  super_user: null
+
+  # 允许使用机器人的普通用户 ID 列表，/adduser 生成的邀请链接会自动写入
+  allowed_users: []
+
+  # 日志文件与日志级别（DEBUG / INFO / WARNING / ERROR）
+  log_file: logs/torrentino.log
+  log_level: INFO
+
+  # 搜索结果排序字段：size（大小）/ date（时间）/ seed（做种数）/ leach（下载数）
+  sort_by: seed
+
+  # 下载历史记录文件
+  download_log_file: download.log
+
+  # 下载通知队列文件，重启后继续推送进度
+  queue_file: config/queue.json
+
+  # 授权站点返回的种子文件大小上限（默认 10 MiB）
+  max_torrent_size: 10485760
+
+  # 在 Telegram 中显示命令菜单
+  use_menu: true
+
+transmission:
+  # Transmission 服务器地址、端口、账号密码
+  host: localhost
+  port: 9091
+  user: null
+  password: null
+  # 删除任务时是否同时删除文件（/delete 命令的默认行为）
+  delete_data: true
+  # 下载完成后自动暂停做种（true 时不再继续上传）
+  pause_on_complete: false
+
+directories:
+  # 下载目录：左边的名字会显示成 Telegram 按钮，右边是 Transmission 上的真实路径
+  # 请确保目录已创建，且 Transmission 对这些目录有读写权限
+  # 自动分类会按 auto_classify.rules 里的 dir 字段挑选这里的目录
+  FC2: /downloads/FC2
+  有码: /downloads/有码
+  无码: /downloads/无码
+  国产: /downloads/国产
+  未分类: /downloads/未分类
+
+auto_classify:
+  # 开启后，发送磁力链接时会出现「🤖 自动分类」按钮；
+  # 没有名称参数的磁力链接会在拿到种子信息后自动移动到对应目录
+  enabled: true
+  # 没有命中任何规则时使用的目录（必须在 directories 里有定义）
+  fallback: 未分类
+  # 规则按顺序匹配，先命中者生效；patterns 里是正则，忽略大小写
+  # 想停用某条规则，给它加一行 enabled: false，或直接删掉
+  rules:
+    - name: fc2
+      dir: FC2
+      patterns:
+        - '\bFC2[\s._-]*(?:PPV)?[\s._-]*\d{3,8}\b'
+        - '\bFC2\b'
+    - name: 国产
+      dir: 国产
+      patterns:
+        - '国产|國產|国内自拍|自拍流出'
+        - '麻豆|天美|果冻|精东|星空|蜜桃|糖心|含羞草|香蕉|探花|司机社|91'
+        - 'MD[\s._-]?\d{3,5}'
+        - 'SWAG|ONLYFANS|FANSLY|JVID'
+    - name: 无码
+      dir: 无码
+      patterns:
+        - '无码|無碼|無修正|无修正|破解|流出|leak(?:ed)?|uncensored|decensored'
+        - '1pondo|10musume|pacopacomama|caribbeancom|heydouga|tokyo[-_ ]?hot'
+        - '(?<![A-Za-z0-9])\d{3,5}[-_ ]?UC(?![A-Za-z0-9])'
+    - name: 有码
+      dir: 有码
+      # 通用番号规则：ABC-123 / SSIS001，已排除 x264、1080p、HEVC、年份等常见误判
+      patterns:
+        - '(?<![A-Za-z0-9])(?!(?:MP4|MKV|AVI|WMV|MOV|TS|M2TS|RMVB|FLV|WEBM|X264|X265|H264|H265|HEVC|AVC|AV1|VP9|DIVX|XVID|AAC|AC3|DTS|DDP|DD|FLAC|MP3|ATMOS|HD|FHD|UHD|SD|HDR|SDR|HDRIP|BDRIP|WEBRIP|HDTV|BLURAY|CD|DVD|BD|DISC|PART|VOL|EP|SE|SP|FPS|BIT|KBPS|MBPS|CH|AUDIO|SUB|CHS|CHT)(?![A-Za-z0-9]))([A-Za-z]{2,6})[\s._-]?((?!(?:19|20)\d{2}(?!\d))\d{2,5})(?![0-9A-Za-z])'
+
+notify:
+  # 是否推送进度卡片（下载中会原地刷新同一条消息）
+  progress: true
+  # 轮询 Transmission 的间隔，单位秒
+  check_interval: 30
+  # 同一条进度卡片的最短刷新间隔，单位秒
+  progress_interval: 45
+  # 需要额外提醒的进度节点，留空 [] 表示只更新卡片
+  milestones: []
+  # 超过多少分钟没有进度就提醒一次，0 表示关闭
+  stalled_minutes: 30
+
+# 站点账号：默认只启用 rutor，其它站点需要注册后填账号并设置 enabled: true
+trackers:
+  nnmclub:
+    enabled: false
+    user: <email or login>
+    password: <password>
+  toloka:
+    enabled: false
+    user: <email or login>
+    password: <password>
+  rutracker:
+    enabled: false
+    user: <email or login>
+    password: <password>
+  rutor:
+    enabled: true
+
+# 代理
+proxy:
+  enabled: false
+  url: 127.0.0.1:7777
+  # 建议使用自签 CA，而不是关闭校验
+  verify_tls: true
+
+# FC2 频道推送：从 sukebei.nyaa.si 的 FC2-PPV RSS 抓新条目，核验后推进私有频道
+fc2:
+  # 频道 ID，形如 -100xxxxxxxxxx，机器人必须是频道管理员（发帖 + 删帖）
+  channel_id: <channel_id>
+  # 轮询间隔，单位秒，低于 120 按 120 算
+  interval: 600
+  # 首次启动最多回补多少条历史条目，0 表示不回补
+  backfill_limit: 10
+  # 只给 FC2 官网、fc2ppvdb 和图片用的日本代理，nyaa 与 Telegram 不走它
+  proxy: http://<jp-proxy-host>:<port>
+  verify_tls: true

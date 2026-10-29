@@ -120,3 +120,15 @@ proxy:
   url: 127.0.0.1:7777
   # 建议使用自签 CA，而不是关闭校验
   verify_tls: true
+
+# FC2 频道推送：从 sukebei.nyaa.si 的 FC2-PPV RSS 抓新条目，核验后推进私有频道
+fc2:
+  # 频道 ID，形如 -100xxxxxxxxxx，机器人必须是频道管理员（发帖 + 删帖）
+  channel_id: <channel_id>
+  # 轮询间隔，单位秒，低于 120 按 120 算
+  interval: 600
+  # 首次启动最多回补多少条历史条目，0 表示不回补
+  backfill_limit: 10
+  # 只给 FC2 官网、fc2ppvdb 和图片用的日本代理，nyaa 与 Telegram 不走它
+  proxy: http://<jp-proxy-host>:<port>
+  verify_tls: true
