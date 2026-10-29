@@ -598,10 +598,20 @@ class Fc2Pusher:
                 if limit
                 else (incremental, [])
             )
+            # 回补占位不能抢了要推的号：同一个 FC2 编号在 RSS 里出现两次时
+            # （旧的在回补里、新的在要推的最后几条里），旧的不能先记 seen，
+            # 否则新的那条在 _push_entry 里会因 seen 已存在被跳过，白白丢一张新卡。
+            pushed_numbers = {
+                extract_number(entry["title"]) for entry in incremental
+            }
             changed = False
             for entry in backlog:
                 number = extract_number(entry["title"])
-                if number and number not in self.store.seen:
+                if (
+                    number
+                    and number not in self.store.seen
+                    and number not in pushed_numbers
+                ):
                     self.store.remember(number, entry)
                     changed = True
             if changed:
@@ -648,6 +658,8 @@ class Fc2Pusher:
         caption = _caption(entry, number, censor_label=censor, detail=detail_zh or description_ja)
         keyboard = _keyboard(number)
         try:
+            # 媒体组走 NAS 7890 代理上传 6-10 张图时，PTB 默认 20 秒写超时很容易
+            # 误报 Timed out（服务端其实已收到，像 4973177 那次），放宽到 120 秒。
             if len(photos) == 1:
                 sent = [
                     await self.bot.send_photo(
@@ -656,6 +668,9 @@ class Fc2Pusher:
                         caption=caption,
                         parse_mode=ParseMode.HTML,
                         reply_markup=keyboard,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30,
                     )
                 ]
             else:
@@ -668,7 +683,13 @@ class Fc2Pusher:
                     for index, photo in enumerate(photos)
                 ]
                 sent = list(
-                    await self.bot.send_media_group(chat_id=channel_id, media=media)
+                    await self.bot.send_media_group(
+                        chat_id=channel_id,
+                        media=media,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30,
+                    )
                 )
                 if sent:
                     # 媒体组发不了 reply_markup，只能单独挂到第一条上

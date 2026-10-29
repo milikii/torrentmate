@@ -548,3 +548,26 @@ async def test_run_skipped_when_enabled_false(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         await asyncio.wait_for(pusher.run(), timeout=1)
     assert calls == []
+
+
+async def test_backfill_does_not_let_old_duplicate_block_new_push(tmp_path, monkeypatch):
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch, backfill_limit=2)
+    entries = [
+        {"title": "FC2-PPV-5000545 old", "guid": "https://sukebei.nyaa.si/view/1",
+         "hash": "a" * 40, "pub_ts": 1000, "size": "1 GiB"},
+        {"title": "FC2-PPV-5000001", "guid": "https://sukebei.nyaa.si/view/2",
+         "hash": "b" * 40, "pub_ts": 1001, "size": "1 GiB"},
+        {"title": "FC2-PPV-5000545 new", "guid": "https://sukebei.nyaa.si/view/3",
+         "hash": "c" * 40, "pub_ts": 1002, "size": "1 GiB"},
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/x.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"bytes"])
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    await pusher._poll_once(-1001234)
+
+    # 要推的最后两条都推了，包括新版 5000545；旧版只记不推、且不能先占 seen
+    assert len(bot.photos) == 2
+    assert store.entry("5000545")["messages"] != []
+    assert store.last_ts == 1002
