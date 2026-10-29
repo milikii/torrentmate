@@ -121,10 +121,15 @@ proxy:
   # 建议使用自签 CA，而不是关闭校验
   verify_tls: true
 
-# FC2 频道推送：从 sukebei.nyaa.si 的 FC2-PPV RSS 抓新条目，核验后推进私有频道
+# FC2 推送：从 sukebei.nyaa.si 的 FC2-PPV RSS 抓新条目，核验后推送
 fc2:
-  # 频道 ID，形如 -100xxxxxxxxxx，机器人必须是频道管理员（发帖 + 删帖）
-  channel_id: <channel_id>
+  # 专用机器人模式：老机器人这里设 enabled: false 就不推 FC2，只留下载监控；
+  # FC2 专用机器人这里设 true（或不填，默认 true）才推，避免两个机器人重复推同一张卡。
+  # enabled: true
+  # 推送目标：不填就推给 bot.super_user 的私聊（默认用法，私聊里按钮能正常显示和点）。
+  # 填频道 ID（形如 -100xxxxxxxxxx，机器人必须是频道管理员）就推到频道，但频道创建者
+  # 在管理员视图里看不到内联按钮，所以只服务一个人时不要用频道。
+  # chat_id: <chat_id>
   # 轮询间隔，单位秒，低于 120 按 120 算
   interval: 600
   # 首次启动最多回补多少条历史条目，0 表示不回补

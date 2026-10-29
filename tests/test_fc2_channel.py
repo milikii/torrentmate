@@ -515,3 +515,36 @@ def test_translate_prefers_google_over_mymemory(monkeypatch):
     monkeypatch.setattr(fc2.requests, "get", fake_get)
     assert fc2._translate_ja_to_zh("元サッカー", "http://proxy:7890") == "谷歌翻译结果"
     assert "translate.googleapis.com" in calls[0]
+
+
+# ---------------------------------------------------------------- 私聊推送目标
+
+def test_target_chat_id_prefers_chat_id_then_channel_then_super_user(monkeypatch):
+    class Cfg:
+        def __init__(self, fc2, super_user=None):
+            self.fc2 = fc2
+            self.super_user = super_user
+
+        def get(self, path, default=None):
+            if str(path).startswith("fc2."):
+                return self.fc2.get(str(path)[4:], default)
+            if path == "bot.super_user":
+                return self.super_user
+            return default
+
+    bot = FakeBot()
+    assert fc2.Fc2Pusher(bot, config=Cfg({"chat_id": 111}))._target_chat_id() == 111
+    assert fc2.Fc2Pusher(bot, config=Cfg({"channel_id": -100222}))._target_chat_id() == -100222
+    assert fc2.Fc2Pusher(bot, config=Cfg({"channel_id": "<channel_id>"}), )._target_chat_id() is None
+    pusher = fc2.Fc2Pusher(bot, config=Cfg({}, super_user=555164303))
+    assert pusher._target_chat_id() == 555164303
+
+
+async def test_run_skipped_when_enabled_false(tmp_path, monkeypatch, caplog):
+    pusher, _store, _bot = make_pusher(tmp_path, monkeypatch, channel_id=-1001234)
+    monkeypatch.setattr(pusher, "_setting", lambda key, default=None: False if key == "enabled" else pusher.config.get(f"fc2.{key}", default))
+    calls = []
+    monkeypatch.setattr(fc2, "_http_get", lambda *a, **k: calls.append(a))
+    with caplog.at_level(logging.INFO):
+        await asyncio.wait_for(pusher.run(), timeout=1)
+    assert calls == []

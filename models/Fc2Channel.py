@@ -546,10 +546,27 @@ class Fc2Pusher:
         proxy = self._setting("proxy")
         return None if _is_placeholder(proxy) else str(proxy)
 
+    def _target_chat_id(self):
+        """推送目标：优先 fc2.chat_id，其次旧 fc2.channel_id，都没配就推给 super_user 私聊。
+
+        私聊是现在默认的用法：频道创建者在管理员视图里看不到内联按钮，
+        只有私聊里按钮才能正常显示、正常点。super_user 的私聊 chat_id
+        就是 super_user 本人的用户 ID，Telegram 私聊就是这么定的。
+        """
+        for key in ("chat_id", "channel_id"):
+            value = self._setting(key)
+            if not _is_placeholder(value):
+                return value
+        super_user = self.config.get("bot.super_user")
+        return None if _is_placeholder(super_user) else super_user
+
     async def run(self) -> None:
-        channel_id = self._setting("channel_id")
-        if _is_placeholder(channel_id):
-            log.warning("fc2.channel_id 未配置，FC2 频道推送任务跳过")
+        if self._setting("enabled", True) is False:
+            log.info("fc2.enabled=false，FC2 推送任务跳过（专用机器人模式下老机器人就靠这个关掉）")
+            return
+        channel_id = self._target_chat_id()
+        if channel_id is None:
+            log.warning("FC2 推送目标未配置（fc2.chat_id / fc2.channel_id / bot.super_user 都没有），FC2 推送任务跳过")
             return
         interval = max(int(self._setting("interval", DEFAULT_INTERVAL) or 0), MIN_INTERVAL)
         while True:
