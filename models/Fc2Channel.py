@@ -691,16 +691,18 @@ class Fc2Pusher:
                         connect_timeout=30,
                     )
                 )
+                # 媒体组按钮实测教训：服务端说键盘已挂在组上（再挂一次会报
+                # not modified），但用户 Android 客户端就是不渲染组内按钮。
+                # 所以组内不再依赖 edit 挂按钮，改在组下面单独发一条带按钮
+                # 的文字消息——单条文字消息的键盘所有客户端都正常显示。
+                # 这条消息也要记进 state，点「不感兴趣」删卡时一起删掉。
                 if sent:
-                    # 媒体组发不了 reply_markup，只能单独挂到第一条上
-                    try:
-                        await self.bot.edit_message_reply_markup(
-                            chat_id=channel_id,
-                            message_id=sent[0].message_id,
-                            reply_markup=keyboard,
-                        )
-                    except Exception as err:  # noqa: BLE001
-                        log.debug("FC2 卡片按钮挂载失败 %s: %s", number, err)
+                    button_msg = await self.bot.send_message(
+                        chat_id=channel_id,
+                        text=f"FC2-PPV-{number}",
+                        reply_markup=keyboard,
+                    )
+                    sent.append(button_msg)
         except Exception as err:  # noqa: BLE001
             log.error("FC2 频道推送失败 %s: %s", number, err)
             return

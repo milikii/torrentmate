@@ -75,6 +75,7 @@ class FakeBot:
         self.photos = []
         self.groups = []
         self.markups = []
+        self.messages = []
         self._next_id = 100
 
     def _message(self):
@@ -88,6 +89,10 @@ class FakeBot:
     async def send_media_group(self, **kwargs):
         self.groups.append(kwargs)
         return [self._message() for _ in kwargs["media"]]
+
+    async def send_message(self, **kwargs):
+        self.messages.append(kwargs)
+        return self._message()
 
     async def edit_message_reply_markup(self, **kwargs):
         self.markups.append(kwargs)
@@ -571,3 +576,27 @@ async def test_backfill_does_not_let_old_duplicate_block_new_push(tmp_path, monk
     assert len(bot.photos) == 2
     assert store.entry("5000545")["messages"] != []
     assert store.last_ts == 1002
+
+
+async def test_media_group_gets_a_separate_button_message(tmp_path, monkeypatch):
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/1.jpg", "https://img/2.jpg"])
+    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"1", b"2"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
+
+    await pusher._push_entry(
+        {"title": "FC2-PPV-5000545 x", "hash": "a" * 40, "pub_ts": 11, "guid": "https://sukebei.nyaa.si/view/1"},
+        -1001234,
+    )
+
+    assert len(bot.groups) == 1
+    assert len(bot.messages) == 1
+    assert bot.messages[0]["text"] == "FC2-PPV-5000545"
+    kb = bot.messages[0]["reply_markup"]
+    assert kb.inline_keyboard[0][0].callback_data == "fc2dl:5000545"
+    assert kb.inline_keyboard[0][1].callback_data == "fc2no:5000545"
+    # 组内 2 张 + 按钮消息 1 条，都记进 state，删卡时一起删
+    assert len(store.entry("5000545")["messages"]) == 3
+    assert bot.markups == []
