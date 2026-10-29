@@ -6,9 +6,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from transmission_rpc.client import Client
+
 import lib.bot_handlers as handlers
 from lib import auth
 from lib.classifier import DEFAULT_RULES
+from lib.func import trans
 from lib.magnet import extract_magnets, parse_magnet
 from models.BotConfigurator import BotConfigurator
 from models.DownloadQueue import DownloadQueue, QueueEntry
@@ -46,10 +49,23 @@ class FakeTorrent:
         return None
 
 
+class FakeFile:
+    def __init__(self, payload: bytes, downloads: list[Path]):
+        self.payload = payload
+        self.downloads = downloads
+
+    async def download_to_drive(self, destination):
+        path = Path(destination)
+        self.downloads.append(path)
+        path.write_bytes(self.payload)
+
+
 class FakeBot:
     def __init__(self):
         self.sent = []
         self.edits = []
+        self.payload = b""
+        self.downloads: list[Path] = []
 
     async def send_message(self, **kwargs):
         self.sent.append(kwargs)
@@ -58,6 +74,9 @@ class FakeBot:
     async def edit_message_text(self, **kwargs):
         self.edits.append(kwargs)
         return True
+
+    async def get_file(self, file_id):
+        return FakeFile(self.payload, self.downloads)
 
 
 class FakeClient:
@@ -119,6 +138,7 @@ def make_update(callback_data="__auto__"):
             chat=SimpleNamespace(id=9), message_id=77, text="preview"
         ),
         answer=_async_noop,
+        edit_message_reply_markup=_async_noop,
     )
     return SimpleNamespace(
         callback_query=query,
@@ -152,6 +172,7 @@ def env(tmp_path, monkeypatch):
                     "rules": DEFAULT_RULES,
                 },
                 "notify": {"progress": True},
+                "trackers": {"rutracker": {"base_url": "https://rutracker.invalid"}},
             },
             allow_unicode=True,
             sort_keys=False,
@@ -297,3 +318,308 @@ async def test_batch_add_reports_failure(env, monkeypatch):
     await handlers.confirmDirChoice(update, context)
 
     assert "失败 3 个" in env.bot.edits[-1]["text"]
+
+
+def existing_torrent(torrent_id: int, info_hash: str):
+    return SimpleNamespace(id=torrent_id, name="old", info_hash=info_hash)
+
+
+def install_client(monkeypatch, torrents, add_result=None, add_error=None):
+    client = object.__new__(TransmissionClient)
+    calls = []
+
+    def get_torrents():
+        return torrents() if callable(torrents) else list(torrents)
+
+    def fake_add(self, torrent, **kwargs):
+        calls.append({"torrent": torrent, **kwargs})
+        if add_error is not None:
+            raise add_error
+        return add_result
+
+    monkeypatch.setattr(client, "get_torrents", get_torrents)
+    monkeypatch.setattr(Client, "add_torrent", fake_add)
+    monkeypatch.setattr(handlers, "get_torrent_connection", lambda: client)
+    return calls
+
+
+def torrent_upload_context(bot, file_name="sample.torrent"):
+    return SimpleNamespace(
+        user_data={
+            "torrent": {
+                "type": "torrent",
+                "file_name": file_name,
+                "file_id": "file-id",
+            }
+        },
+        bot=bot,
+    )
+
+
+def torrent_url_context(bot, url, tracker=None, title="sample"):
+    data = {"type": "url", "url": url, "title": title}
+    if tracker:
+        data["tracker"] = tracker
+    return SimpleNamespace(user_data={"torrent": data}, bot=bot)
+
+
+async def test_single_duplicate_keeps_original_entry_and_sends_only_notice(
+    env, tmp_path, monkeypatch
+):
+    source = tmp_path / "source.torrent"
+    info_hash = write_torrent(source)
+    env.bot.payload = source.read_bytes()
+    state = tmp_path / "queue.json"
+    DownloadQueue.set_state_file(str(state))
+    original = QueueEntry(
+        torrent_id=55,
+        chat_id=8,
+        lang_code="en",
+        title="old title",
+        requested_dir="/downloads/FC2",
+        info_hash=info_hash.upper(),
+        auto_classify=True,
+        message_id=777,
+        progress_card=False,
+        milestones_sent={25, 50},
+        last_card_text="old card",
+        classified=True,
+        final_dir="/downloads/FC2",
+    )
+    DownloadQueue.add(original)
+    before_json = original.to_json()
+    before_state = state.read_text(encoding="utf-8")
+    calls = install_client(
+        monkeypatch, [existing_torrent(55, info_hash.upper())]
+    )
+
+    await handlers.confirmDirChoice(make_update("__auto__"), torrent_upload_context(env.bot))
+
+    assert calls == []
+    assert DownloadQueue.get(55) is original
+    assert original.to_json() == before_json
+    assert state.read_text(encoding="utf-8") == before_state
+    assert [message["text"] for message in env.bot.sent] == [
+        trans("SINGLE_ADD_DUPLICATE", "zh-hans")
+    ]
+    assert not env.bot.downloads[-1].exists()
+
+    DownloadQueue._items.clear()
+    DownloadQueue.load()
+    restored = DownloadQueue.get(55)
+    assert restored.to_json() == before_json
+
+
+async def test_single_skips_same_hash_from_upload_search_and_magnet(
+    env, tmp_path, monkeypatch
+):
+    source = tmp_path / "source.torrent"
+    info_hash = write_torrent(source)
+    env.bot.payload = source.read_bytes()
+    DownloadQueue.add(
+        QueueEntry(torrent_id=1, chat_id=8, info_hash=info_hash.upper())
+    )
+    calls = install_client(monkeypatch, [])
+
+    copy = tmp_path / "renamed.torrent"
+    assert write_torrent(copy, tracker=b"https://another.invalid") == info_hash
+    env.bot.payload = copy.read_bytes()
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_upload_context(env.bot, "renamed.torrent"),
+    )
+
+    downloaded = tmp_path / "search.torrent"
+    write_torrent(downloaded, tracker=b"https://third.invalid")
+    monkeypatch.setattr(
+        handlers,
+        "get_search",
+        lambda: SimpleNamespace(download=lambda url, tracker: str(downloaded)),
+    )
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_url_context(env.bot, "https://tracker.invalid/dl/1", "rutracker"),
+    )
+    assert not downloaded.exists()
+
+    magnet = f"magnet:?xt=urn:btih:{info_hash.upper()}&dn=renamed"
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_url_context(env.bot, magnet),
+    )
+
+    assert calls == []
+    assert DownloadQueue.size() == 1
+    assert len(env.bot.sent) == 3
+    assert all(
+        message["text"] == trans("SINGLE_ADD_DUPLICATE", "zh-hans")
+        for message in env.bot.sent
+    )
+
+
+async def test_single_same_name_different_hash_is_added(env, tmp_path, monkeypatch):
+    source = tmp_path / "source.torrent"
+    info_hash = write_torrent(source)
+    env.bot.payload = source.read_bytes()
+    old_hash = "f" * 40
+    original = QueueEntry(
+        torrent_id=1,
+        chat_id=8,
+        info_hash=old_hash,
+        message_id=777,
+        title="video.bin",
+    )
+    DownloadQueue.add(original)
+    before_json = original.to_json()
+    snapshot = [SimpleNamespace(id=1, name="video.bin", info_hash=old_hash)]
+    added = FakeTorrent(3, "video.bin", "/downloads/未分类")
+    added.info_hash = info_hash.upper()
+    calls = install_client(monkeypatch, snapshot, add_result=added)
+
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_upload_context(env.bot),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["download_dir"] == "/downloads/未分类"
+    assert DownloadQueue.get(1) is original
+    assert original.to_json() == before_json
+    assert original.message_id == 777
+    entry = DownloadQueue.get(3)
+    assert entry is not None
+    assert entry.info_hash == info_hash
+    assert entry.message_id == 1001
+    card_text = env.bot.sent[0]["text"]
+    assert "video.bin" in card_text
+    assert all(
+        message["text"] != trans("AUTO_CLASSIFY_ON", "zh-hans")
+        for message in env.bot.sent
+    )
+    assert not env.bot.downloads[-1].exists()
+
+
+async def test_single_transmission_existing_without_queue_entry_is_skipped(
+    env, tmp_path, monkeypatch
+):
+    source = tmp_path / "source.torrent"
+    info_hash = write_torrent(source)
+    env.bot.payload = source.read_bytes()
+    url_hash = "abcabcabcabcabcabcabcabcabcabcabcabcabca"
+    snapshot = [existing_torrent(1, info_hash), existing_torrent(2, url_hash)]
+    url_torrent = SimpleNamespace(id=2, name="url", info_hash=url_hash)
+    calls = install_client(monkeypatch, snapshot, add_result=url_torrent)
+
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"), torrent_upload_context(env.bot)
+    )
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_url_context(env.bot, "https://tracker.invalid/dl/2"),
+    )
+
+    assert len(calls) == 1
+    assert DownloadQueue.size() == 0
+    assert [message["text"] for message in env.bot.sent] == [
+        trans("SINGLE_ADD_DUPLICATE", "zh-hans"),
+        trans("SINGLE_ADD_DUPLICATE", "zh-hans"),
+    ]
+
+
+async def test_single_rpc_result_matching_queue_entry_is_preserved(
+    env, monkeypatch
+):
+    info_hash = "0123456789abcdef0123456789abcdef01234567"
+    original = QueueEntry(
+        torrent_id=9,
+        chat_id=8,
+        lang_code="en",
+        title="queued",
+        info_hash=info_hash,
+        message_id=777,
+        progress_card=False,
+        milestones_sent={25},
+        last_card_text="old card",
+        auto_classify=True,
+        classified=True,
+    )
+    DownloadQueue.add(original)
+    before_json = original.to_json()
+    result = SimpleNamespace(id=9, name="again", info_hash=info_hash.upper())
+    calls = install_client(monkeypatch, [], add_result=result)
+
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_url_context(env.bot, "https://tracker.invalid/dl/9"),
+    )
+
+    assert len(calls) == 1
+    assert DownloadQueue.get(9) is original
+    assert original.to_json() == before_json
+    assert [message["text"] for message in env.bot.sent] == [
+        trans("SINGLE_ADD_DUPLICATE", "zh-hans")
+    ]
+
+
+async def test_single_lookup_failure_aborts_without_adding(env, tmp_path, monkeypatch):
+    state = tmp_path / "queue.json"
+    DownloadQueue.set_state_file(str(state))
+    original = QueueEntry(torrent_id=9, chat_id=8, message_id=777)
+    DownloadQueue.add(original)
+    before_state = state.read_text(encoding="utf-8")
+
+    def fail_lookup():
+        raise RuntimeError("RPC list unavailable")
+
+    calls = install_client(monkeypatch, fail_lookup)
+
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"),
+        torrent_url_context(env.bot, "https://tracker.invalid/dl/9"),
+    )
+
+    assert calls == []
+    assert DownloadQueue.get(9) is original
+    assert state.read_text(encoding="utf-8") == before_state
+    assert len(env.bot.sent) == 1
+    assert "RPC list unavailable" in env.bot.sent[0]["text"]
+    assert env.bot.sent[0]["text"] != trans("SINGLE_ADD_DUPLICATE", "zh-hans")
+
+
+async def test_single_new_add_cleans_temp_and_announces_auto_classify(
+    env, tmp_path, monkeypatch
+):
+    source = tmp_path / "source.torrent"
+    info_hash = write_torrent(source)
+    env.bot.payload = source.read_bytes()
+    added = FakeTorrent(4, "video.bin", "/downloads/未分类")
+    added.info_hash = info_hash
+    calls = install_client(monkeypatch, [], add_result=added)
+
+    await handlers.confirmDirChoice(make_update("__auto__"), torrent_upload_context(env.bot))
+
+    assert len(calls) == 1
+    assert DownloadQueue.get(4) is not None
+    assert [message["text"] for message in env.bot.sent][-1] == trans(
+        "AUTO_CLASSIFY_ON", "zh-hans"
+    )
+    assert not env.bot.downloads[-1].exists()
+
+
+async def test_single_add_error_cleans_temp_without_queue_entry(
+    env, tmp_path, monkeypatch
+):
+    source = tmp_path / "source.torrent"
+    write_torrent(source)
+    env.bot.payload = source.read_bytes()
+    install_client(
+        monkeypatch, [], add_error=RuntimeError("transmission is down")
+    )
+
+    await handlers.confirmDirChoice(
+        make_update("/downloads/未分类"), torrent_upload_context(env.bot)
+    )
+
+    assert DownloadQueue.size() == 0
+    assert not env.bot.downloads[-1].exists()
+    assert "transmission is down" in env.bot.sent[0]["text"]

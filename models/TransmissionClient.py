@@ -7,10 +7,15 @@ from transmission_rpc.client import Client
 from transmission_rpc.torrent import Torrent
 
 from lib.func import get_logger
+from lib.magnet import parse_magnet
 
 from models.DownloadQueue import DownloadQueue, QueueEntry
 
 log = get_logger("TransmissionClient")
+
+
+class TorrentAlreadyExists(Exception):
+    pass
 
 
 class TransmissionClient(Client):
@@ -58,27 +63,53 @@ class TransmissionClient(Client):
         title: str | None = None,
         auto_classify: bool = False,
         message_id: int | None = None,
+        single_dedup: bool = False,
         **kwargs: Any,
     ) -> Torrent:
         """添加任务并把通知信息写入下载队列。"""
         if download_dir:
             kwargs["download_dir"] = download_dir
-        _torrent = super().add_torrent(torrent, **kwargs)
-
-        DownloadQueue.add(
-            QueueEntry(
-                torrent_id=_torrent.id,
-                chat_id=int(chat_id),
-                lang_code=lang_code,
-                title=title or _torrent.name or "",
-                requested_dir=str(download_dir or ""),
-                info_hash=str(getattr(_torrent, "info_hash", "") or "").lower()
-                or None,
-                auto_classify=auto_classify,
-                message_id=message_id,
-                final_dir=str(download_dir) if download_dir else None,
+        existing: dict[str, Torrent] = {}
+        if single_dedup:
+            existing = {
+                str(info_hash).lower(): item
+                for info_hash, item in self.existing_hashes().items()
+            }
+            known_hashes = set(existing)
+            known_hashes.update(
+                str(item.info_hash).lower()
+                for item in DownloadQueue.snapshot().values()
+                if item.info_hash
             )
+            source_hash = ""
+            if isinstance(torrent, Path):
+                source_hash = self.torrent_file_hash(torrent).lower()
+            elif isinstance(torrent, str):
+                magnet = parse_magnet(torrent)
+                source_hash = str(getattr(magnet, "info_hash", "") or "").lower()
+            if source_hash and source_hash in known_hashes:
+                raise TorrentAlreadyExists(source_hash)
+        _torrent = super().add_torrent(torrent, **kwargs)
+        actual_hash = str(getattr(_torrent, "info_hash", "") or "").lower()
+
+        entry = QueueEntry(
+            torrent_id=_torrent.id,
+            chat_id=int(chat_id),
+            lang_code=lang_code,
+            title=title or _torrent.name or "",
+            requested_dir=str(download_dir or ""),
+            info_hash=actual_hash or None,
+            auto_classify=auto_classify,
+            message_id=message_id,
+            final_dir=str(download_dir) if download_dir else None,
         )
+        if single_dedup:
+            if actual_hash and actual_hash in existing:
+                raise TorrentAlreadyExists(actual_hash)
+            if not DownloadQueue.add_if_new(entry):
+                raise TorrentAlreadyExists(actual_hash)
+        else:
+            DownloadQueue.add(entry)
         return _torrent
 
     @staticmethod

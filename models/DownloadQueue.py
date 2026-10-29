@@ -118,6 +118,22 @@ class DownloadQueue:
         cls._save()
 
     @classmethod
+    def add_if_new(cls, entry: QueueEntry) -> bool:
+        new_hash = str(entry.info_hash or "").lower()
+        with cls._lock:
+            for existing in cls._items.values():
+                existing_hash = str(existing.info_hash or "").lower()
+                if existing_hash and new_hash:
+                    duplicate = existing_hash == new_hash
+                else:
+                    duplicate = existing.torrent_id == entry.torrent_id
+                if duplicate:
+                    return False
+            cls._items[entry.torrent_id] = entry
+        cls._save()
+        return True
+
+    @classmethod
     def get(cls, torrent_id: int) -> QueueEntry | None:
         with cls._lock:
             return cls._items.get(int(torrent_id))

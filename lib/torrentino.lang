@@ -23,6 +23,7 @@ ADDING_TORRENT_FILE_IS_CORRUPTED=File is corrupted or the link does not contain 
                                  - website or file is not accessible
                                  - corrupted or wrong file
 ADDING_FILE_SOMETHING_WENT_WRONG=Failed to add the torrent
+SINGLE_ADD_DUPLICATE=⏭ This torrent already exists, duplicate adding skipped; existing notifications will not change
 SOMETHING_WENT_WRONG=Something went wrong
 DOWNLOAD_COMPLETED=Download completed: {}
 TORRENT_INFO_PAGE_HEADER=page {} of {} ({} files)
@@ -129,6 +130,7 @@ ADDING_TORRENT_FILE_IS_CORRUPTED=❌ 文件损坏，或链接并不是种子文�
                                  - 站点或文件无法访问
                                  - 文件损坏或类型不对
 ADDING_FILE_SOMETHING_WENT_WRONG=❌ 添加失败
+SINGLE_ADD_DUPLICATE=⏭ 该任务已存在，已跳过重复添加；已有通知不会更改
 SOMETHING_WENT_WRONG=出错了
 DOWNLOAD_COMPLETED=下载完成：{}
 TORRENT_INFO_PAGE_HEADER=第 {} / {} 页（共 {} 个文件）
@@ -230,6 +232,7 @@ NOTHING_FOUND=沒有找到相關結果。
 CHOOSE_DOWNLOAD_DIR=請選擇《{}》的儲存目錄：
 ADDING_TORRENT_FILE_IS_CORRUPTED=❌ 檔案損壞，或連結不是種子檔案。
 ADDING_FILE_SOMETHING_WENT_WRONG=❌ 新增失敗
+SINGLE_ADD_DUPLICATE=⏭ 該任務已存在，已跳過重複新增；已有通知不會更改
 SOMETHING_WENT_WRONG=出錯了
 DOWNLOAD_COMPLETED=下載完成：{}
 TORRENT_INFO_PAGE_HEADER=第 {} / {} 頁（共 {} 個檔案）

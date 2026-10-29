@@ -45,7 +45,7 @@ from models.PostsBrowser import PostsBrowser
 from models.SearchTorrents import SearchTorrents
 from models.TorrentInfoBrowser import TorrentInfoBrowser
 from models.TorrentsListBrowser import TorrentsListBrowser
-from models.TransmissionClient import TransmissionClient
+from models.TransmissionClient import TransmissionClient, TorrentAlreadyExists
 
 bot_config = BotConfigurator()
 
@@ -522,7 +522,14 @@ async def _add_single(  # noqa: C901
             download_dir=target,
             title=data.get("title"),
             auto_classify=auto,
+            single_dedup=True,
         )
+    except TorrentAlreadyExists:
+        await context.bot.send_message(
+            chat_id=chat_id, text=trans("SINGLE_ADD_DUPLICATE", lang_code)
+        )
+        log.info("Skipped duplicate single torrent %s", torrent_source)
+        return
     except Exception as err:  # noqa: BLE001
         text = trans("ADDING_FILE_SOMETHING_WENT_WRONG", lang_code) + ":\n" + str(err)
         if any(
