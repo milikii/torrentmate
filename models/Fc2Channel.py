@@ -200,14 +200,16 @@ def _official_description(html: str) -> str:
     return text[:400]
 
 
-def _censor_label(tags: list[str], description: str) -> str:
-    """有码/无码/薄码三选一：無修正优先，薄モザイク/薄消し次之，其余默认有码。
+def _censor_label(tags: list[str]) -> str:
+    """有码/无码/薄码三选一，只看官网商品标签，卖家详情文案一律不算。
 
-    注意：默认有码是 FC2 下载版的常态，个别卖家把无码版放购买者消息里的
-    （如 4973177 详情写下载版有马赛克、无码版在消息里），按标签会判成有码，
-    这是按下载版判的，不算误判成无码。
+    無修正标签 => 无码；薄モザイク/薄消し标签 => 薄码（实测 12 部里
+    薄码标签一次都没出现过，保留这条规则只是为了标签真有它时能显示）；
+    其余（包括没有任何码标签的）默认有码，这是 FC2 资源本身的常态，
+    不是卖家说的。个别卖家把无码版放购买者消息里的，按标签判成有码
+    是按资源本身判的，不算误判成无码。
     """
-    text = " ".join(tags or []) + " " + (description or "")
+    text = " ".join(tags or [])
     if "無修正" in text:
         return "无码"
     if "薄モザイク" in text or "薄消し" in text:
@@ -216,32 +218,53 @@ def _censor_label(tags: list[str], description: str) -> str:
 
 
 def _translate_ja_to_zh(text: str, proxy: str | None) -> str:
-    """日译中：走 MyMemory 免费接口，失败/超配额返回空串，调用方回退原文。
+    """日译中：先走配置的 NAS 代理，不通再换路，全部失败返回空串回退原文。
 
-    Google 翻译 gtx 在 NAS 代理下报 429 不可用，MyMemory 实测可用，
-    匿名配额有限所以只译前 400 字，超了就回退原文不跳过卡片。
+    顺序：MyMemory 走配置代理（NAS 上就是 7890）-> MyMemory 走环境代理
+    （容器里 HTTP_PROXY 也是 7890，等于还是走代理）-> Google gtx 走配置代理。
+    Google gtx 在 NAS 代理下曾报 429，只当最后兜底，不靠它。只译前 400 字，
+    翻译失败绝不跳过卡片，调用方回退日文原文。
     """
     if not text:
         return ""
-    try:
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        response = requests.get(
-            "https://api.mymemory.translated.net/get",
-            params={"q": text, "langpair": "ja|zh-CN"},
-            proxies=proxies,
-            timeout=15,
-            headers={"User-Agent": USER_AGENT},
-        )
-        if response.status_code != 200:
-            return ""
-        translated = (response.json().get("responseData") or {}).get("translatedText") or ""
-        translated = translated.strip()
-        if not translated or "QUERY_LENGTH_LIMIT" in translated or translated == text:
-            return ""
-        return translated
-    except Exception as err:  # noqa: BLE001
-        log.debug("FC2 详情翻译失败: %s", err)
-        return ""
+    attempts = []
+    if proxy:
+        attempts.append(("mymemory", {"http": proxy, "https": proxy}))
+    attempts.append(("mymemory", None))
+    if proxy:
+        attempts.append(("google", {"http": proxy, "https": proxy}))
+    for provider, proxies in attempts:
+        try:
+            if provider == "mymemory":
+                response = requests.get(
+                    "https://api.mymemory.translated.net/get",
+                    params={"q": text, "langpair": "ja|zh-CN"},
+                    proxies=proxies,
+                    timeout=15,
+                    headers={"User-Agent": USER_AGENT},
+                )
+                if response.status_code != 200:
+                    continue
+                translated = (response.json().get("responseData") or {}).get("translatedText") or ""
+            else:
+                response = requests.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={"client": "gtx", "sl": "ja", "tl": "zh-CN", "dt": "t", "q": text},
+                    proxies=proxies,
+                    timeout=15,
+                    headers={"User-Agent": USER_AGENT},
+                )
+                if response.status_code != 200:
+                    continue
+                data = response.json()
+                translated = "".join(part[0] for part in (data[0] or []) if part)
+            translated = translated.strip()
+            if translated and "QUERY_LENGTH_LIMIT" not in translated and translated != text:
+                return translated
+        except Exception as err:  # noqa: BLE001
+            log.debug("FC2 详情翻译失败 %s: %s", provider, err)
+            continue
+    return ""
 
 
 def _fetch_official_detail(number: str, proxy: str | None, verify_tls: bool) -> tuple[list[str], str]:
@@ -537,7 +560,7 @@ class Fc2Pusher:
             return
 
         tags, description_ja = _fetch_official_detail(number, proxy, verify_tls)
-        censor = _censor_label(tags, description_ja)
+        censor = _censor_label(tags)
         detail_zh = _translate_ja_to_zh(description_ja, proxy) if description_ja else ""
         caption = _caption(entry, number, censor_label=censor, detail=detail_zh or description_ja)
         keyboard = _keyboard(number)

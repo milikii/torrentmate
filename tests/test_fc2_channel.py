@@ -429,17 +429,18 @@ def test_official_tags_and_description():
 
 
 @pytest.mark.parametrize(
-    "tags, description, expected",
+    "tags, expected",
     [
-        (["無修正"], "", "无码"),
-        (["素人"], "薄モザイク版です", "薄码"),
-        (["素人"], "薄消し版です", "薄码"),
-        (["素人"], "ダウンロード版にはモザイクをかけています", "有码"),
-        (["素人"], "", "有码"),
+        (["無修正"], "无码"),
+        (["薄モザイク"], "薄码"),
+        (["薄消し"], "薄码"),
+        (["素人"], "有码"),
+        ([], "有码"),
     ],
 )
-def test_censor_label(tags, description, expected):
-    assert fc2._censor_label(tags, description) == expected
+def test_censor_label_only_tags_seller_text_ignored(tags, expected):
+    # 卖家详情文案不算：详情里写薄モザイク也不影响，只看标签
+    assert fc2._censor_label(tags) == expected
 
 
 def test_caption_contains_censor_and_detail():
