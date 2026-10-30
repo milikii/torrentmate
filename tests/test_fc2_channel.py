@@ -185,12 +185,36 @@ def test_parse_feed_drops_items_without_pubdate_or_hash():
         ("fc2ppv 12345", "12345"),
         ("FC2_123456", "123456"),
         ("FC2-PPV-00012345", "12345"),
+        ("FC2PPV 1234567", "1234567"),
+        ("FC2PPV5000545", "5000545"),
+        ("[FC2-PPV-5000545]", "5000545"),
+        ("FC2-5000545", "5000545"),
+        ("FC2-PPV（5000545）", "5000545"),
+        ("FC2PPV（5000545）", "5000545"),
+        ("fc2-ppv-5000545 MixedCase", "5000545"),
+        ("【FC2】1234567 素人", "1234567"),
+        ("FC2-PPV-1234567【素人】", "1234567"),
         ("FC2", None),
         ("FC2-PPV-abc", None),
     ],
 )
 def test_extract_number(title, expected):
     assert fc2.extract_number(title) == expected
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # 黑名单里有 5000545 时，这类非 FC2 名字以前会被误认为该编号
+        "Ubuntu.afc25000545b.iso",
+        "Ubuntu.fc25000545b.iso",
+        "myfc25000545backup.iso",
+        "ubuntu-24.04.1-live",
+        "FC2-PPV-1234567890123",
+    ],
+)
+def test_extract_number_needs_fc2_boundary(title):
+    assert fc2.extract_number(title) is None
 
 
 # ---------------------------------------------------------------- 官网取图
@@ -311,7 +335,8 @@ def test_preview_images_with_seven_official_skips_fc2ppvdb(monkeypatch):
 def make_pusher(tmp_path, monkeypatch, **overrides):
     store = fc2.Fc2Store(str(tmp_path / "fc2_state.json"))
     bot = FakeBot()
-    pusher = fc2.Fc2Pusher(bot, FakeConfig(**overrides), store)
+    blacklist = fc2.Fc2Blacklist(str(tmp_path / "fc2_blacklist.json"))
+    pusher = fc2.Fc2Pusher(bot, FakeConfig(**overrides), store, blacklist)
     return pusher, store, bot
 
 
@@ -335,6 +360,8 @@ async def test_seen_number_is_not_pushed_and_images_not_fetched(
 
 async def test_muted_number_is_not_pushed(tmp_path, monkeypatch):
     pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    # fc2no 同时写共享黑名单和本容器 state.muted；推送判定以黑名单为准。
+    pusher.blacklist.add("5000545", "FC2-PPV-5000545 x", "fc2no")
     store.mute("5000545")
     fetched = []
     monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: fetched.append(a) or [])
@@ -346,6 +373,13 @@ async def test_muted_number_is_not_pushed(tmp_path, monkeypatch):
     assert fetched == []
     assert bot.photos == [] and bot.groups == []
     assert store.entry("5000545") is None
+
+
+async def test_muted_state_alone_does_not_block_push(tmp_path, monkeypatch):
+    # state.muted 是每个容器各一份的兼容记录，不能成为跨容器解不开的第二真相源。
+    pusher, store, _bot = make_pusher(tmp_path, monkeypatch)
+    store.mute("5000545")
+    assert pusher._blocked("5000545") is False
 
 
 async def test_first_run_backfills_only_last_ten(tmp_path, monkeypatch):
@@ -363,6 +397,9 @@ async def test_first_run_backfills_only_last_ten(tmp_path, monkeypatch):
     monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
     monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/x.jpg"])
     monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"bytes"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
     monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
 
     await pusher._poll_once(-1001234)
@@ -376,6 +413,41 @@ async def test_first_run_backfills_only_last_ten(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- 状态 / 磁力 / 未配置
+
+
+def test_unblocked_number_is_not_written_back_by_resident_store(tmp_path):
+    # /fc2unblock 在回调实例里解黑后，常驻推送实例手里那份旧 muted
+    # 不能再被下一次落盘写回 state（否则解黑当场失效）。
+    path = str(tmp_path / "fc2_state.json")
+    resident = fc2.Fc2Store(path)
+    resident.remember("5000545", {"hash": "a" * 40, "title": "t", "pub_ts": 5})
+    resident.mute("5000545")
+    assert resident.is_muted("5000545")
+
+    callback = fc2.Fc2Store(path)
+    callback.unmute("05000545")  # 前导零变体也要一并清掉
+    assert not callback.is_muted("5000545")
+
+    resident.save()  # 常驻实例下一次落盘
+
+    fresh = fc2.Fc2Store(path)
+    assert fresh.muted == set()
+    assert not resident.is_muted("5000545")
+
+
+def test_noop_unmute_does_not_erase_later_mute(tmp_path):
+    # A 对未静音编号做 no-op unmute 不能留下 False delta，否则会抹掉 B 后来的 mute。
+    path = str(tmp_path / "fc2_state.json")
+    first = fc2.Fc2Store(path)
+    second = fc2.Fc2Store(path)
+
+    first.unmute("5000545")
+    second.mute("5000545")
+    first.save()
+
+    fresh = fc2.Fc2Store(path)
+    assert "5000545" in fresh.muted
+    assert fresh.is_muted("5000545")
 
 
 def test_store_roundtrip_and_corruption(tmp_path):
@@ -753,6 +825,7 @@ async def test_window_state_has_card_before_extras_and_finalize_keeps_muted(
     assert store.entry("5000545")["messages"] == [card_id]
 
     store.mute("5000545")
+    pusher.blacklist.add("5000545", "FC2-PPV-5000545 x", "fc2no")
     gate.set()
     await asyncio.wait_for(task, timeout=2)
 
@@ -929,6 +1002,9 @@ async def test_backfill_does_not_let_old_duplicate_block_new_push(tmp_path, monk
     monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
     monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: ["https://img/x.jpg"])
     monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: [b"bytes"])
+    monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
+    monkeypatch.setattr(fc2, "_fetch_official_detail", lambda *a, **k: ([], ""))
+    monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
     monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
 
     await pusher._poll_once(-1001234)
@@ -1050,3 +1126,43 @@ async def test_preview_album_failure_keeps_card_and_state(tmp_path, monkeypatch,
     assert len(bot.photos) == 1
     assert len(store.entry("5000545")["messages"]) == 1
     assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+async def test_blacklisted_number_is_not_pushed_and_does_not_touch_state(
+    tmp_path, monkeypatch
+):
+    # 黑名单独立于 fc2_state.json：state 被重置后黑名单照样拦推送。
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    pusher.blacklist.add("5000545", "FC2-PPV-5000545 x", "fc2no")
+    fetched = []
+    monkeypatch.setattr(fc2, "_preview_images", lambda *a, **k: fetched.append(a) or [])
+
+    await pusher._push_entry(
+        {"title": "FC2-PPV-5000545 x", "hash": "a" * 40, "pub_ts": 11}, -1001234
+    )
+
+    assert fetched == []
+    assert bot.photos == [] and bot.groups == []
+    assert store.entry("5000545") is None
+    assert store.muted == set()
+
+
+async def test_poll_skips_blacklisted_entry(tmp_path, monkeypatch):
+    pusher, store, bot = make_pusher(tmp_path, monkeypatch)
+    pusher.blacklist.add("5000545", "FC2-PPV-5000545 x", "fc2no")
+    entries = [
+        {
+            "title": "FC2-PPV-5000545 x",
+            "guid": "https://sukebei.nyaa.si/view/5000545",
+            "hash": "a" * 40,
+            "pub_ts": 11,
+            "size": "1 GiB",
+        }
+    ]
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: entries)
+    monkeypatch.setattr(fc2, "PUSH_DELAY", 0)
+
+    await pusher._poll_once(-1001234)
+
+    assert bot.photos == [] and bot.groups == []
+    assert store.seen == {}

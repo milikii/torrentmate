@@ -25,6 +25,11 @@ from telegram.constants import ParseMode
 from lib.constants import CONFIG_FILE
 from lib.func import escape_html, get_logger
 from models.BotConfigurator import BotConfigurator
+from models.Fc2Blacklist import (
+    Fc2Blacklist,
+    config_path as blacklist_config_path,
+    normalize_number,
+)
 
 log = get_logger("Fc2Channel")
 
@@ -49,7 +54,12 @@ IMAGE_MAX_BYTES = 5 * 1024 * 1024
 PUSH_DELAY = 2
 REQUEST_TIMEOUT = 20
 
-NUMBER_RE = re.compile(r"(?i)fc2[\s._-]*(?:ppv)?[\s._-]*(\d{5,8})")
+# 只认真正的 FC2 编号形态：fc2 前面不能紧贴字母数字（Ubuntu.afc25000545b.iso
+# 里的 "fc2" 不算），编号后面也不能紧贴字母数字（Ubuntu.fc25000545b.iso
+# 与更长的数字都不算）。裸的 7 位数字只有用户显式输入命令时才算（normalize_number）。
+NUMBER_RE = re.compile(
+    r"(?i)(?<![0-9a-z])fc2(?:[\s._-]*ppv)?[\s._\-\[\]()\u3010\u3011\uff08\uff09]*(\d{5,8})(?![0-9a-z])"
+)
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 OG_IMAGE_RE = re.compile(
     r"<meta[^>]+property=[\"']og:image[\"'][^>]*content=[\"']([^\"']+)[\"']", re.I
@@ -494,15 +504,27 @@ class Fc2Store:
         self.muted: set[str] = set()
         self.retry: set[str] = set()
         self.backfill_done = False
+        # 本次进程里明确 mute/unmute 过的编号（True=加，False=删）。
+        # muted 落盘时以磁盘为基准叠加它，绝不用旧内存整份覆盖。
+        self._muted_delta: dict[str, bool] = {}
+        self._mtime: int = 0
         self.load()
+
+    def _mtime_now(self) -> int:
+        try:
+            return os.stat(self.path).st_mtime_ns
+        except OSError:
+            return 0
 
     def load(self) -> None:
         with self._lock:
+            self._mtime = self._mtime_now()
             self.last_ts = 0.0
             self.seen = {}
             self.muted = set()
             self.retry = set()
             self.backfill_done = False
+            self._muted_delta = {}
             if not os.path.isfile(self.path):
                 return
             try:
@@ -512,7 +534,10 @@ class Fc2Store:
                 self.seen = {
                     str(key): value for key, value in (data.get("seen") or {}).items()
                 }
-                self.muted = {str(item) for item in (data.get("muted") or [])}
+                self.muted = {
+                    normalize_number(item) or str(item)
+                    for item in (data.get("muted") or [])
+                }
                 self.retry = {str(item) for item in (data.get("retry") or [])}
                 self.backfill_done = bool(data.get("backfill_done"))
             except Exception as err:  # noqa: BLE001
@@ -529,12 +554,27 @@ class Fc2Store:
         return data if isinstance(data, dict) else {}
 
     def _merge_disk_muted(self) -> None:
-        """落盘前把磁盘上已有的 muted 并进内存，避免用旧内存覆盖掉它。"""
-        for item in self._disk_state().get("muted") or []:
-            self.muted.add(str(item))
+        """落盘前以磁盘 muted 为基准重算内存 muted。
 
-    def _write(self) -> None:
-        self._merge_disk_muted()
+        不能简单并集：/fc2unblock 在另一个实例里把编号从磁盘删掉之后，
+        常驻推送实例手里的旧内存会把它又并回来（解黑失效）。所以除了
+        本次进程明确 mute/unmute 过的编号（_muted_delta），其余一律以
+        磁盘为准。
+        """
+        merged = {
+            normalize_number(item) or str(item)
+            for item in (self._disk_state().get("muted") or [])
+        }
+        for key, enabled in self._muted_delta.items():
+            if enabled:
+                merged.add(key)
+            else:
+                merged.discard(key)
+        self.muted = merged
+
+    def _write(self, merge_muted: bool = True) -> None:
+        if merge_muted:
+            self._merge_disk_muted()
         data = {
             "last_ts": self.last_ts,
             "seen": self.seen,
@@ -552,6 +592,9 @@ class Fc2Store:
             os.replace(tmp, self.path)
         except Exception as err:  # noqa: BLE001
             log.warning("FC2 状态写盘失败 %s: %s", self.path, err)
+            return
+        self._muted_delta.clear()
+        self._mtime = self._mtime_now()
 
     def save(self) -> None:
         with self._lock:
@@ -589,11 +632,17 @@ class Fc2Store:
         with self._lock:
             self._record(number, entry, messages)
 
-    def finalize(self, number: str, entry: dict, messages) -> bool:
-        """附图传完后的收尾：附图期间被 muted 就不写正常状态，返回 False。"""
+    def finalize(self, number: str, entry: dict, messages, blocked=None) -> bool:
+        """附图传完后的收尾：期间已被拉黑就不写正常状态，返回 False。
+
+        blocked 由调用方传（推送器传黑名单判定），不让 state.muted 变成
+        跨容器解不开的第二真相源；不传时保持旧的 muted 语义兼容测试调用。
+        """
         with self._lock:
             self._merge_disk_muted()
-            if str(number) in self.muted:
+            if blocked is not None and blocked(number):
+                return False
+            if blocked is None and self.is_muted(number):
                 return False
             self._record(number, entry, messages)
             self._write()
@@ -609,16 +658,47 @@ class Fc2Store:
             if existed:
                 self._write()
 
+    def is_muted(self, number: str) -> bool:
+        """muted 一律按归一化编号比（05000545 与 5000545 同一条）。
+
+        磁盘被别人改过（/fc2unblock 在另一个实例里解黑）就先重读，
+        否则常驻推送实例会一直按旧内存判 blocked。
+        """
+        key = normalize_number(number) or str(number)
+        with self._lock:
+            mtime = self._mtime_now()
+            if mtime != self._mtime:
+                self._merge_disk_muted()
+                self._mtime = mtime
+            return key in self.muted
+
+    def unmute(self, number: str) -> None:
+        """解除静音：黑名单里删掉编号后，推送端也要跟着放行。
+
+        按归一化编号一次性清掉所有变体（含前导零写法）；并在 _muted_delta
+        里记一条「删」，这样常驻推送实例下次落盘不会把编号从磁盘旧状态
+        里并回来。
+        """
+        key = normalize_number(number) or str(number)
+        with self._lock:
+            self._merge_disk_muted()
+            if key not in self.muted:
+                return
+            self.muted = {item for item in self.muted if normalize_number(item) != key}
+            self._muted_delta[key] = False
+            self._write()
+
     def mute(self, number: str) -> list[int]:
         """记 muted，同时返回当前已知的消息 id。
 
         读 seen 和写 muted 在同一把锁里：附图上传期间点「不感兴趣」时，
         推流端随后落盘不会把 muted 覆盖掉，也不会漏删卡片。
         """
-        key = str(number)
+        key = normalize_number(number) or str(number)
         with self._lock:
             self._merge_disk_muted()
             self.muted.add(key)
+            self._muted_delta[key] = True
             self.retry.discard(key)
             record = self.seen.get(key) or {}
             if not record:
@@ -638,10 +718,22 @@ class Fc2Store:
 class Fc2Pusher:
     """轮询 nyaa FC2 RSS，核验后把新条目推进频道。"""
 
-    def __init__(self, bot, config=None, store=None) -> None:
+    def __init__(self, bot, config=None, store=None, blacklist=None) -> None:
         self.bot = bot
         self.config = config or BotConfigurator()
         self.store = store or Fc2Store()
+        # 黑名单独立于状态文件：state 被重置后编号还在，这里必须一起看。
+        self.blacklist = blacklist or Fc2Blacklist(blacklist_config_path(self.config))
+
+    def _blocked(self, number: str | None) -> bool:
+        """黑名单命中才跳过推送；state.muted 只是 fc2no 的兼容记录。
+
+        muted 每个容器各一份，/fc2unblock 只能清自己那份；判定统一看
+        共享黑名单，另一个容器解黑后这边不用改 state 就能放行。
+        """
+        if not number:
+            return False
+        return self.blacklist.contains(number)
 
     def _setting(self, key: str, default=None):
         return self.config.get(f"fc2.{key}", default)
@@ -740,7 +832,7 @@ class Fc2Pusher:
         for entry in incremental:
             pub_ts = float(entry["pub_ts"])
             number = extract_number(entry["title"])
-            if number and (number in self.store.muted or number in self.store.seen):
+            if number and (self._blocked(number) or number in self.store.seen):
                 # 已推过 / 已静音的条目直接跳过，不白等 PUSH_DELAY。
                 if number in self.store.retry:
                     self.store.clear_retry([number])
@@ -767,7 +859,7 @@ class Fc2Pusher:
                 number
                 for number in self.store.retry
                 if number not in live
-                or number in self.store.muted
+                or self._blocked(number)
                 or number in self.store.seen
             ]
         )
@@ -778,7 +870,7 @@ class Fc2Pusher:
         if not number:
             log.debug("标题里没有 FC2 编号，跳过: %s", entry["title"])
             return True
-        if number in self.store.muted or number in self.store.seen:
+        if self._blocked(number) or number in self.store.seen:
             return True
 
         proxy = self._proxy()
@@ -867,7 +959,7 @@ class Fc2Pusher:
                 # 附图只是预览，发失败不影响卡片和按钮；状态照记，避免下一轮重推整张卡。
                 log.warning("FC2 预览图发送失败 %s: %s", number, err)
 
-        if not self.store.finalize(number, entry, sent_ids):
+        if not self.store.finalize(number, entry, sent_ids, self._blocked):
             # 附图上传期间用户点了「不感兴趣」：删掉自己发的图，保持 muted，
             # 不记成正常推送，也不许把 muted 覆盖回去。
             for message_id in sent_ids:

@@ -130,3 +130,6 @@ fc2:
   # 只给 FC2 官网、fc2ppvdb 和图片用的日本代理，nyaa 与 Telegram 不走它
   proxy: http://<jp-proxy-host>:<port>
   verify_tls: true
+  # 黑名单（编号 + 名字 + 时间 + 来源），默认 config/fc2_blacklist.json；
+  # 两个容器要共享就指到同一个共享卷路径。
+  # blacklist_file: /usr/src/app/shared/fc2_blacklist.json

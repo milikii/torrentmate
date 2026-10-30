@@ -5,6 +5,7 @@ import re
 import secrets
 import tempfile
 import time
+from datetime import datetime
 
 import pydash as _
 from telegram import Update
@@ -40,6 +41,15 @@ from models.BotConfigurator import BotConfigurator
 from models.Browser import Browser
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue
+from models.Fc2Blacklist import (
+    SOURCE_DELETE,
+    SOURCE_MANUAL,
+    SOURCE_MUTE,
+    Fc2Blacklist,
+    config_path as blacklist_config_path,
+    normalize_number,
+    source_label,
+)
 from models.Fc2Channel import Fc2Store, extract_number, _magnet
 from models.HistoryBrowser import HistoryBrowser
 from models.PostsBrowser import PostsBrowser
@@ -241,10 +251,22 @@ async def chooseDownloadDir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["torrent"] = {"type": "url", "url": title, "title": title}
 
     context.user_data.pop("batch", None)
-    await update.message.reply_text(
-        trans("CHOOSE_DOWNLOAD_DIR", lang_code).format(_truncate(title or "", 80)),
-        reply_markup=_dir_keyboard(lang_code),
-    )
+    try:
+        prompt = await update.message.reply_text(
+            trans("CHOOSE_DOWNLOAD_DIR", lang_code).format(
+                _truncate(title or "", 80)
+            ),
+            reply_markup=_dir_keyboard(lang_code),
+        )
+    except TelegramError as err:
+        # 预览没发出去，不能留下“有 torrent + 旧 torrent_prompt”这种可被认领的组合。
+        context.user_data.pop("torrent", None)
+        context.user_data.pop("torrent_prompt", None)
+        context.user_data.pop("torrent_prompt_chat", None)
+        log.warning("单条预览发送失败: %s", err)
+        return
+    context.user_data["torrent_prompt"] = prompt.message_id
+    context.user_data["torrent_prompt_chat"] = update.message.chat.id
 
 
 # ---------------------------------------------------------------- 批量磁力链接
@@ -259,7 +281,6 @@ async def batchMagnets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not links:
         return
 
-    context.user_data["batch"] = links
     context.user_data.pop("torrent", None)
 
     classifier = get_classifier()
@@ -286,12 +307,39 @@ async def batchMagnets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("\n" + trans("BATCH_NAME_HINT", lang_code))
     lines.append("\n" + trans("BATCH_CHOOSE", lang_code))
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_dir_keyboard(lang_code),
-        disable_web_page_preview=True,
-    )
+    try:
+        prompt = await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_dir_keyboard(lang_code),
+            disable_web_page_preview=True,
+        )
+    except TelegramError as err:
+        old_prompt = context.user_data.get("batch_prompt")
+        old_prompt_chat = context.user_data.pop("batch_prompt_chat", None)
+        # 预览没发出去，不能留下“新批次 + 旧预览 ID”这种能通过认领检查的组合。
+        context.user_data.pop("batch", None)
+        context.user_data.pop("batch_prompt", None)
+        if old_prompt is not None:
+            # 旧预览的键盘也得清掉，否则它还能消费后来发送的单条。
+            # 旧预览可能发在别的聊天里，优先用它自己记录的 chat。
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=(
+                        old_prompt_chat
+                        if old_prompt_chat is not None
+                        else update.message.chat.id
+                    ),
+                    message_id=old_prompt,
+                    reply_markup=None,
+                )
+            except TelegramError as clear_err:
+                log.debug("清理过期批量按钮键盘失败: %s", clear_err)
+        log.warning("批量预览发送失败: %s", err)
+        return
+    context.user_data["batch"] = links
+    context.user_data["batch_prompt"] = prompt.message_id
+    context.user_data["batch_prompt_chat"] = update.message.chat.id
 
 
 async def _add_batch(  # noqa: C901
@@ -302,6 +350,30 @@ async def _add_batch(  # noqa: C901
     links: list[MagnetLink | str | pathlib.Path] = context.user_data.pop("batch", [])
     if not links:
         return
+
+    prompt_id = context.user_data.pop("batch_prompt", None)
+    prompt_chat = context.user_data.pop("batch_prompt_chat", None)
+    if prompt_id is not None and (
+        prompt_id != query.message.message_id
+        or (prompt_chat is not None and prompt_chat != query.message.chat.id)
+    ):
+        # 这是旧批次留下的预览按钮，不能让它按旧目录消费新批次。
+        context.user_data["batch"] = links
+        context.user_data["batch_prompt"] = prompt_id
+        if prompt_chat is not None:
+            context.user_data["batch_prompt_chat"] = prompt_chat
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                reply_markup=None,
+            )
+        except TelegramError as err:
+            log.debug("清理过期批量按钮键盘失败: %s", err)
+        log.debug("忽略过期批量按钮 %s", query.data)
+        return
+    context.user_data["batch_prompt"] = query.message.message_id
+    context.user_data["batch_prompt_chat"] = query.message.chat.id
 
     try:
         client = get_torrent_connection()
@@ -315,6 +387,8 @@ async def _add_batch(  # noqa: C901
         # 查重失败不能按空库继续添加，RPC 返回已有任务时会覆盖通知队列。
         # 保留批量预览，用户可以重试原目录按钮，不丢待添加任务。
         context.user_data["batch"] = links
+        context.user_data["batch_prompt"] = query.message.message_id
+        context.user_data["batch_prompt_chat"] = query.message.chat.id
         log.warning("批量查重失败，未添加任何任务: %s", err)
         await context.bot.send_message(
             chat_id=query.message.chat.id,
@@ -337,12 +411,15 @@ async def _add_batch(  # noqa: C901
             message_id=message_id,
             text=trans("BATCH_ADDING", lang_code).format(0, len(links)),
             parse_mode=ParseMode.HTML,
+            reply_markup=_dir_keyboard(lang_code),
         )
     except TelegramError as err:
         log.debug("无法更新批量提示消息: %s", err)
-        message_id = None
+        # 内容未变化是良性无操作，消息还在，后面的结果编辑照常走。
+        if "message is not modified" not in str(err).lower():
+            message_id = None
 
-    added, duplicates, failed = [], [], []
+    added, duplicates, failed, blocked = [], [], [], []
     for index, item in enumerate(links, 1):
         if isinstance(item, MagnetLink):
             link = item
@@ -351,6 +428,23 @@ async def _add_batch(  # noqa: C901
                 raw=str(item), info_hash="", name=pathlib.Path(item).stem
             )
         info_hash = str(link.info_hash or "").lower()
+        try:
+            blocked_number = _fc2_blocked_number(link.name)
+        except Exception as err:  # noqa: BLE001
+            # 黑名单检查失败不能放行，也不能丢掉待添加项，保留原批量供重试。
+            context.user_data["batch"] = links
+            context.user_data["batch_prompt"] = query.message.message_id
+            context.user_data["batch_prompt_chat"] = query.message.chat.id
+            log.warning("批量黑名单检查失败，本次批量未完成: %s", err)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="黑名单检查失败，本次批量未完成，可重试原按钮",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if blocked_number:
+            blocked.append(blocked_number)
+            continue
         try:
             torrent_source = link.raw
             path = None
@@ -404,6 +498,7 @@ async def _add_batch(  # noqa: C901
                     message_id=message_id,
                     text=trans("BATCH_ADDING", lang_code).format(index, len(links)),
                     parse_mode=ParseMode.HTML,
+                    reply_markup=_dir_keyboard(lang_code),
                 )
             except TelegramError:
                 pass
@@ -443,6 +538,13 @@ async def _add_batch(  # noqa: C901
                 ),
             )
         )
+    if blocked:
+        lines.append(
+            "🚫 黑名单命中 {0} 条，已跳过：{1}".format(
+                len(blocked),
+                "、".join(f"FC2-PPV-{number}" for number in blocked[:5]),
+            )
+        )
     if failed:
         lines.append(trans("BATCH_FAILED", lang_code).format(len(failed)))
         for link, reason in failed[:5]:
@@ -454,6 +556,9 @@ async def _add_batch(  # noqa: C901
         lines.append("\n" + trans("BATCH_TIPS", lang_code))
 
     text = "\n".join(lines)
+    context.user_data.pop("batch_prompt", None)
+    context.user_data.pop("batch_prompt_chat", None)
+    edited = False
     if message_id:
         try:
             await context.bot.edit_message_text(
@@ -462,12 +567,47 @@ async def _add_batch(  # noqa: C901
                 text=text,
                 parse_mode=ParseMode.HTML,
             )
-            return
+            edited = True
         except TelegramError:
             pass
-    await context.bot.send_message(
-        chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
-    )
+    if not edited:
+        for attempt in range(2):
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
+                )
+                edited = True
+                break
+            except TelegramError as err:
+                if attempt == 0:
+                    # 网络瞬断先重试一次（不引入延时依赖，只让出事件循环）。
+                    await asyncio.sleep(0)
+                    continue
+                # 两次都没发出去，也不能把下面的兜底清键盘一起带走；
+                # 汇总逐条追加到 user_data，下次交互时补发，不再永久丢失。
+                # pending 只活在 user_data 内存里，机器人重启会丢；本函数不做落盘持久化。
+                pending = context.user_data.setdefault("pending_batch_results", [])
+                pending.append((chat_id, text))
+                # 5 条只是软上限：合并会拼出超长消息时宁可条目多，也绝不丢未送达汇总。
+                while len(pending) > 5:
+                    first_chat, first_text = pending[0]
+                    second_chat, second_text = pending[1]
+                    if (
+                        first_chat != second_chat
+                        or len(first_text) + len(second_text) + 2 > 3000
+                    ):
+                        break
+                    pending[:2] = [(first_chat, first_text + "\n\n" + second_text)]
+                log.warning("批量结果发送失败: %s", err)
+    # 兜底：不管上面哪条编辑链走通，原消息上的键盘都必须清掉。
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=query.message.chat.id,
+            message_id=query.message.message_id,
+            reply_markup=None,
+        )
+    except TelegramError as err:
+        log.debug("清理批量按钮键盘失败: %s", err)
 
 
 async def _add_single(  # noqa: C901
@@ -475,6 +615,27 @@ async def _add_single(  # noqa: C901
 ):
     query = update.callback_query
     lang_code = query.from_user.language_code
+    prompt_id = context.user_data.pop("torrent_prompt", None)
+    prompt_chat = context.user_data.pop("torrent_prompt_chat", None)
+    if prompt_id is not None and (
+        prompt_id != query.message.message_id
+        or (prompt_chat is not None and prompt_chat != query.message.chat.id)
+    ):
+        # 这是旧单条预览留下的按钮，不能让它按旧目录消费新单条。
+        if "torrent" in context.user_data:
+            context.user_data["torrent_prompt"] = prompt_id
+            if prompt_chat is not None:
+                context.user_data["torrent_prompt_chat"] = prompt_chat
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                reply_markup=None,
+            )
+        except TelegramError as err:
+            log.debug("清理过期单条按钮键盘失败: %s", err)
+        log.debug("忽略过期单条按钮 %s", query.data)
+        return
     data = context.user_data.pop("torrent", None)
     if not data:
         return
@@ -487,6 +648,13 @@ async def _add_single(  # noqa: C901
         await query.edit_message_reply_markup(reply_markup=None)
     except TelegramError:
         pass
+
+    blocked = _fc2_blocked_number(data.get("title") or data.get("file_name"))
+    if blocked:
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"FC2-PPV-{blocked} 在你黑名单里，已跳过这一条"
+        )
+        return
 
     tmp_file_path = None
     is_temp_file = False
@@ -572,6 +740,21 @@ async def confirmDirChoice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """用户选择目录后的统一入口（单条 / 批量）。"""
     query = update.callback_query
     await query.answer()
+    pending = context.user_data.pop("pending_batch_results", None)
+    if pending:
+        undelivered = []
+        for pending_chat_id, pending_text in pending:
+            try:
+                await context.bot.send_message(
+                    chat_id=pending_chat_id,
+                    text=pending_text,
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError as err:
+                undelivered.append((pending_chat_id, pending_text))
+                log.debug("补发批量结果失败: %s", err)
+        if undelivered:
+            context.user_data["pending_batch_results"] = undelivered
     if context.user_data and "batch" in context.user_data:
         await _add_batch(update, context, query.data)
     else:
@@ -806,6 +989,8 @@ async def torrentDelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delete_data=bot_config.get("transmission.delete_data"),
     )
     DownloadQueue.remove(torrent_id)
+    # 机器人里手动删的 FC2 任务也记黑名单，不然下一轮推送 / 再发磁力又加回来。
+    _remember_fc2_deletion(name)
 
 
 @restricted
@@ -850,6 +1035,7 @@ async def callbackDeleteTorrent(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     DownloadQueue.remove(torrent_id)
+    _remember_fc2_deletion(name)
     text = trans(
         "TORRENT_REMOVED_WITH_DATA" if delete_data else "TORRENT_REMOVED_KEEP_DATA",
         lang_code,
@@ -868,6 +1054,36 @@ async def callbackDeleteTorrent(update: Update, context: ContextTypes.DEFAULT_TY
 def _fc2_store() -> Fc2Store:
     """回调用一个新实例，状态以磁盘为准（不是和推送器共享同一个对象）。"""
     return Fc2Store()
+
+
+def _fc2_blacklist() -> Fc2Blacklist:
+    """黑名单实例：路径取 fc2.blacklist_file，两个容器要指同一个文件才共享。"""
+    return Fc2Blacklist(blacklist_config_path(bot_config))
+
+
+def _fc2_number(raw) -> str | None:
+    """把用户输入归一成编号：FC2-PPV-5000545 / fc2ppv 5000545 / 5000545 都认。"""
+    text = str(raw or "").strip()
+    return extract_number(text) or normalize_number(text)
+
+
+def _fc2_blocked_number(title) -> str | None:
+    """标题里能提出编号且该编号在黑名单里，就返回编号，否则 None。"""
+    number = extract_number(title)
+    if not number:
+        return None
+    return number if _fc2_blacklist().contains(number) else None
+
+
+def _remember_fc2_deletion(name) -> None:
+    """机器人里删 FC2 任务时顺手记黑名单（名字就取任务名），写失败不能影响删除。"""
+    number = extract_number(name)
+    if not number:
+        return
+    try:
+        _fc2_blacklist().add(number, str(name or ""), SOURCE_DELETE)
+    except Exception as err:  # noqa: BLE001
+        log.debug("记 FC2 黑名单失败 %s: %s", number, err)
 
 
 def _fc2_records() -> list[dict]:
@@ -897,6 +1113,9 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
     number = query.data.split(":", 1)[1]
+    if _fc2_blacklist().contains(number):
+        await query.answer("这个你拉黑过，已跳过")
+        return
     entry = _fc2_store().entry(number)
     if not entry:
         await query.answer("这条已过期")
@@ -931,6 +1150,19 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     number = query.data.split(":", 1)[1]
     store = _fc2_store()
+    # 卡片上的「不感兴趣」是黑名单的主路径：编号 + seen 里的标题 + 来源一起记。
+    # add() 写盘失败会返回 None（而不是谎报成功），这里要如实回给用户。
+    recorded = True
+    try:
+        record = store.entry(number) or {}
+        recorded = bool(
+            _fc2_blacklist().add(number, record.get("title") or "", SOURCE_MUTE)
+        )
+    except Exception as err:  # noqa: BLE001
+        log.debug("记 FC2 黑名单失败 %s: %s", number, err)
+        recorded = False
+    if not recorded:
+        log.warning("FC2 黑名单写入失败，编号 %s 只落了 state.muted", number)
     # 删卡片要删到卡片实际在的地方：私聊优先，旧频道卡片走旧 channel_id
     channel_id = None
     for key in ("fc2.chat_id", "fc2.channel_id"):
@@ -950,7 +1182,10 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as err:  # noqa: BLE001
             log.debug("删除 FC2 频道消息失败 %s: %s", message_id, err)
-    await query.answer("已删除，以后不再推送")
+    if recorded:
+        await query.answer("已删除，以后不再推送")
+    else:
+        await query.answer("已删除，但记进黑名单失败，重启后可能还会推送")
 
 
 @restricted
@@ -1001,8 +1236,403 @@ async def fc2info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------------------------------------------------------------- 状态 / 限速 / 规则
+# ---------------------------------------------------------------- FC2 黑名单 / 比对
 
+
+def _fc2_timestamp(value) -> str:
+    try:
+        return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "-"
+
+
+def _fc2_title_for(number: str) -> str:
+    """给黑名单找名字：先看推送状态里的 seen，再看下载历史。"""
+    try:
+        record = _fc2_store().entry(number) or {}
+    except Exception:  # noqa: BLE001
+        record = {}
+    title = str(record.get("title") or "")
+    if title:
+        return title
+    try:
+        for item in DownloadHistory.show():
+            name = str(item.get("name") or "")
+            if extract_number(name) == number:
+                return name
+    except Exception as err:  # noqa: BLE001
+        log.debug("读下载历史失败 %s: %s", number, err)
+    return ""
+
+
+def _fc2_compare(torrents, blacklist) -> tuple[list, dict]:
+    """比对 tr-bt 任务与黑名单：返回（黑名单命中, 同编号多任务）。
+
+    去重口径：编号统一 extract_number 归一（不带前导零），标题里提不出
+    编号的任务不参与比对；同一编号下 info_hash 相同算完全重复，
+    info_hash 不同算同编号多版本。
+    """
+    hits: list[tuple[str, object, dict]] = []
+    groups: dict[str, list] = {}
+    for torrent in torrents:
+        number = extract_number(getattr(torrent, "name", "") or "")
+        if not number:
+            continue
+        groups.setdefault(number, []).append(torrent)
+        record = blacklist.get(number)
+        if record:
+            hits.append((number, torrent, record))
+    duplicates = {key: items for key, items in groups.items() if len(items) > 1}
+    return hits, duplicates
+
+
+def _fc2_kept_and_extra(items) -> tuple[object, list, bool]:
+    """同编号多任务：建议保留最早添加的那个，其余算多余；并标出同 hash。"""
+    ordered = sorted(items, key=lambda item: str(getattr(item, "added_date", "") or ""))
+    hashes = {str(getattr(item, "info_hash", "") or "").lower() for item in items}
+    return ordered[0], ordered[1:], len(hashes) < len(items)
+
+
+def _fc2_disk_leftovers(torrents, limit: int = 10) -> tuple[list[str], list[str]]:
+    """磁盘有文件、tr-bt 没任务：只扫配置里 directories 的顶层条目。
+
+    机器人容器默认不挂下载目录，这时目录都不存在，报告里如实说明需要
+    加只读挂载，不假装能扫磁盘。只报编号在整个 tr-bt 里都找不到的条目，
+    避免把多文件任务误报成残留。
+    """
+    directories = dict(bot_config.get("directories") or {})
+    numbers = {extract_number(getattr(item, "name", "") or "") for item in torrents}
+    numbers.discard(None)
+    found: list[str] = []
+    missing: list[str] = []
+    for name, path in directories.items():
+        if not os.path.isdir(str(path)):
+            missing.append(str(path))
+            continue
+        try:
+            with os.scandir(str(path)) as entries:
+                for entry in entries:
+                    number = extract_number(entry.name)
+                    if not number or number in numbers:
+                        continue
+                    found.append(f"{name}/{entry.name}")
+                    if len(found) >= limit:
+                        break
+        except OSError as err:
+            log.debug("扫下载目录失败 %s: %s", path, err)
+        if len(found) >= limit:
+            break
+    return found, missing
+
+
+@restricted
+async def fc2check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """已存影片比对：只出报告，不删任何东西。"""
+    chat_id = update.message.chat.id
+    if chat_id != _super_user_id():
+        await context.bot.send_message(chat_id=chat_id, text="只有超级用户能跑比对")
+        return
+    try:
+        torrents = await asyncio.to_thread(get_torrent_connection().get_torrents)
+    except Exception as err:  # noqa: BLE001
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="读 tr-bt 任务失败：" + escape_html(_truncate(str(err), 120)),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    hits, duplicates = _fc2_compare(torrents, _fc2_blacklist())
+    lines = ["<b>FC2 比对报告</b>（只报告，不删任何东西）", ""]
+    if hits:
+        lines.append(f"🚫 黑名单命中该删：{len(hits)} 个任务")
+        for number, torrent, record in hits[:10]:
+            lines.append(
+                f"  • FC2-PPV-{number}  id={getattr(torrent, 'id', '?')}  "
+                f"{escape_html(_truncate(str(getattr(torrent, 'name', '')), 50))}"
+            )
+            lines.append(
+                f"    来源 {escape_html(source_label(record.get('source')))}"
+                f" · {escape_html(_fc2_timestamp(record.get('added_ts')))}"
+            )
+        if len(hits) > 10:
+            lines.append(f"  …还有 {len(hits) - 10} 个")
+    else:
+        lines.append("🚫 黑名单命中：没有")
+    lines.append("")
+    if duplicates:
+        lines.append(f"♻️ 同编号多任务：{len(duplicates)} 组")
+        for number, items in list(duplicates.items())[:5]:
+            keep, extra, same_hash = _fc2_kept_and_extra(items)
+            lines.append(
+                f"  • FC2-PPV-{number}：{len(items)} 个任务，建议保留 "
+                f"id={getattr(keep, 'id', '?')}，多余 "
+                + ",".join(str(getattr(item, "id", "?")) for item in extra)
+            )
+            lines.append(
+                "    同 info_hash："
+                + ("有（内容完全重复）" if same_hash else "无（同编号不同版本）")
+            )
+    else:
+        lines.append("♻️ 同编号多任务：没有")
+    lines.append("")
+    found, missing = _fc2_disk_leftovers(torrents)
+    lines.append(
+        "🗂 磁盘有文件、tr-bt 没任务："
+        + (f"{len(found)} 条（顶层条目）" if found else "没扫到")
+    )
+    lines.extend(f"  • {escape_html(item)}" for item in found)
+    if missing:
+        lines.append(
+            "  未挂载的下载目录："
+            + "、".join(escape_html(item) for item in missing[:5])
+            + "（容器加只读挂载后才能扫）"
+        )
+    if hits:
+        numbers = " ".join(number for number, _torrent, _record in hits[:10])
+        lines.append("")
+        lines.append(f"确认要删：<code>/fc2del {escape_html(numbers)}</code>")
+        lines.append(
+            "（只删 tr-bt 任务，本地文件保留；编号已在黑名单，不会被推送或加回来）"
+        )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@restricted
+async def fc2del_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """确认删除：只删黑名单命中的 tr-bt 任务，必须显式给编号。
+
+    /fc2check 只出清单不动手，删是另一步；不带参数什么都不删。
+    本地数据默认保留（delete_data=False），要不要连文件一起删由用户另外定。
+    """
+    chat_id = update.message.chat.id
+    if chat_id != _super_user_id():
+        await context.bot.send_message(chat_id=chat_id, text="只有超级用户能删任务")
+        return
+    numbers: list[str] = []
+    for raw in context.args or []:
+        number = _fc2_number(raw)
+        if number and number not in numbers:
+            numbers.append(number)
+    if not numbers:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "用法：/fc2del <编号...>，编号从 /fc2check 的报告里抄。\n"
+                "只删黑名单命中的任务，本地文件保留；不给编号就什么都不删。"
+            ),
+        )
+        return
+    blacklist = _fc2_blacklist()
+    allowed = [number for number in numbers if blacklist.contains(number)]
+    refused = [number for number in numbers if number not in allowed]
+    if not allowed:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="这些编号不在黑名单里，未删任何任务："
+            + "、".join(f"FC2-PPV-{number}" for number in refused)
+            + "\n要删先 /fc2block <编号>。",
+        )
+        return
+    client = get_torrent_connection()
+    try:
+        torrents = await asyncio.to_thread(client.get_torrents)
+    except Exception as err:  # noqa: BLE001
+        await context.bot.send_message(
+            chat_id=chat_id, text="读 tr-bt 任务失败：" + _truncate(str(err), 120)
+        )
+        return
+    wanted = set(allowed)
+    targets = [
+        torrent
+        for torrent in torrents
+        if extract_number(getattr(torrent, "name", "") or "") in wanted
+    ]
+    if not targets:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="tr-bt 里没有这些编号的任务："
+            + "、".join(f"FC2-PPV-{number}" for number in allowed),
+        )
+        return
+    removed, failed = [], []
+    for torrent in targets:
+        number = extract_number(getattr(torrent, "name", "") or "")
+        try:
+            await asyncio.to_thread(
+                client.remove_torrent, torrent.id, delete_data=False
+            )
+        except Exception as err:  # noqa: BLE001
+            failed.append((number, getattr(torrent, "id", "?"), str(err)))
+            continue
+        DownloadQueue.remove(torrent.id)
+        removed.append((number, getattr(torrent, "id", "?")))
+    lines = [f"已删除 {len(removed)} 个 tr-bt 任务（本地文件保留）："]
+    lines.extend(
+        f"  • FC2-PPV-{number}  id={torrent_id}" for number, torrent_id in removed
+    )
+    if failed:
+        lines.append(f"删除失败 {len(failed)} 个：")
+        lines.extend(
+            f"  • FC2-PPV-{number}  id={torrent_id}："
+            + escape_html(_truncate(err, 80))
+            for number, torrent_id, err in failed
+        )
+    if refused:
+        lines.append(
+            "未在黑名单、未动：" + "、".join(f"FC2-PPV-{n}" for n in refused)
+        )
+    lines.append("编号留在黑名单里，不会再被推送 / 加回来；要恢复用 /fc2unblock <编号>。")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@restricted
+async def fc2block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手动拉黑：/fc2block <编号> 记一条；不带参数列出现有黑名单。"""
+    chat_id = update.message.chat.id
+    if chat_id != _super_user_id():
+        await context.bot.send_message(chat_id=chat_id, text="只有超级用户能改黑名单")
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        entries = _fc2_blacklist().all()
+        if not entries:
+            await context.bot.send_message(
+                chat_id=chat_id, text="黑名单是空的。用法：/fc2block <FC2 编号>"
+            )
+            return
+        lines = [f"<b>FC2 黑名单</b>（{len(entries)} 条）", ""]
+        for record in entries[:30]:
+            title = escape_html(_truncate(record.get("title") or "（没有名字）", 40))
+            lines.append(
+                f"FC2-PPV-{record['number']}  {title}\n"
+                f"  {escape_html(source_label(record.get('source')))}"
+                f" · {escape_html(_fc2_timestamp(record.get('added_ts')))}"
+            )
+        if len(entries) > 30:
+            lines.append(f"…还有 {len(entries) - 30} 条")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+    number = _fc2_number(raw)
+    if not number:
+        await context.bot.send_message(
+            chat_id=chat_id, text="识别不出 FC2 编号，用法：/fc2block <FC2 编号>"
+        )
+        return
+    try:
+        title = _fc2_title_for(number)
+        blacklist = _fc2_blacklist()
+        recorded = bool(blacklist.add(number, title, SOURCE_MANUAL))
+    except Exception as err:  # noqa: BLE001
+        log.warning("记 FC2 黑名单失败 %s: %s", number, err)
+        blacklist = None
+        recorded = False
+    if not recorded:
+        record, read_ok = (None, True)
+        if blacklist is not None:
+            record, read_ok = blacklist.lookup(number)
+        if blacklist is not None and not read_ok:
+            text = f"读不到黑名单，FC2-PPV-{number} 这次没确认也没改动（读取失败）"
+        elif record:
+            text = (
+                f"FC2-PPV-{number} 条目本来就在黑名单里，拦截仍然生效；"
+                "只是标题/来源补写没写成功（写盘失败）"
+            )
+        else:
+            text = (
+                f"记录失败，FC2-PPV-{number} 没有进黑名单（写盘失败），"
+                "拦截不会生效"
+            )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    suffix = (
+        f"（{escape_html(_truncate(title, 40))}）"
+        if title
+        else "（名字没查到，只记了编号）"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"已拉黑 FC2-PPV-{number}{suffix}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@restricted
+async def fc2unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """取消拉黑：黑名单删编号，同时把 state 里的 muted 一并解除。"""
+    chat_id = update.message.chat.id
+    if chat_id != _super_user_id():
+        await context.bot.send_message(chat_id=chat_id, text="只有超级用户能改黑名单")
+        return
+    numbers: list[str] = []
+    for raw in context.args or []:
+        number = _fc2_number(raw)
+        if number and number not in numbers:
+            numbers.append(number)
+    if not numbers:
+        await context.bot.send_message(
+            chat_id=chat_id, text="用法：/fc2unblock <编号...>"
+        )
+        return
+    blacklist = _fc2_blacklist()
+    store = _fc2_store()
+    removed, failed, missing, unreadable = [], [], [], []
+    for number in numbers:
+        if blacklist.remove(number):
+            removed.append(number)
+            store.unmute(number)
+            continue
+        record, read_ok = blacklist.lookup(number)
+        if not read_ok:
+            unreadable.append(number)
+        elif record:
+            failed.append(number)
+        else:
+            missing.append(number)
+    lines = []
+    if removed:
+        lines.append(
+            "已取消拉黑：" + "、".join(f"FC2-PPV-{number}" for number in removed)
+        )
+    if failed:
+        lines.append(
+            "取消拉黑没生效，"
+            + "、".join(f"FC2-PPV-{number}" for number in failed)
+            + " 仍在黑名单里（写盘失败）"
+        )
+    if unreadable:
+        lines.append(
+            "读不到黑名单（读取失败），这些编号一个都没动："
+            + "、".join(f"FC2-PPV-{number}" for number in unreadable)
+        )
+    if missing:
+        lines.append(
+            "这些编号不在黑名单里："
+            + "、".join(f"FC2-PPV-{number}" for number in missing)
+        )
+    if lines:
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
+# ---------------------------------------------------------------- 状态 / 限速 / 规则
 
 @restricted
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1214,9 +1844,13 @@ HANDLERS = [
     CommandHandler("rules", rules_command),
     CommandHandler("classify", classify_command),
     CommandHandler("speed", speed_command),
-    # FC2 频道：记录查询
+    # FC2 频道：记录查询 / 黑名单 / 已存比对
     CommandHandler("fc2list", fc2list_command),
     CommandHandler("fc2", fc2info_command),
+    CommandHandler("fc2check", fc2check_command),
+    CommandHandler("fc2del", fc2del_command),
+    CommandHandler("fc2block", fc2block_command),
+    CommandHandler("fc2unblock", fc2unblock_command),
     # 底部键盘按钮（多语言文案）
     MessageHandler(Regex(button_regex("menu.torrents")), torrentList),
     MessageHandler(Regex(button_regex("menu.search")), lastSearchResults),

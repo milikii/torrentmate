@@ -4,6 +4,8 @@
 logs/
 config/torrentino.yaml
 config/queue.json
+config/fc2_blacklist.json
+config/fc2_blacklist.json.lock
 config/download.log
 config/transmission/
 downloads/

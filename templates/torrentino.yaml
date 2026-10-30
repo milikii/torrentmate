@@ -137,3 +137,8 @@ fc2:
   # 只给 FC2 官网、fc2ppvdb 和图片用的日本代理，nyaa 与 Telegram 不走它
   proxy: http://<jp-proxy-host>:<port>
   verify_tls: true
+  # 黑名单文件（编号 + 名字 + 时间 + 来源），默认落在本 config 目录下的
+  # fc2_blacklist.json。fc2bot 与下载机器人是两个容器、各挂自己的 config，
+  # 要让两边查到同一份黑名单，就挂一个共享目录到两个容器，并把这里指到
+  # 同一个路径，例如 /usr/src/app/shared/fc2_blacklist.json。
+  # blacklist_file: /usr/src/app/shared/fc2_blacklist.json
