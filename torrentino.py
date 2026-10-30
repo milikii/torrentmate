@@ -82,8 +82,8 @@ def bot():
         app.add_handlers(HANDLERS)
         """Run the bot until the user presses Ctrl-C"""
         app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except InvalidToken as err:
-        log.info("Invalid token provided: %s", str(err))
+    except InvalidToken:
+        log.info("Invalid token provided")
         sys.exit(1)
     except Exception as err:
         log.exception("Unhandled bot error: %s", err)

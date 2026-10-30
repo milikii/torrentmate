@@ -978,15 +978,22 @@ async def torrentDelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = torrent.name
     except Exception:  # noqa: BLE001
         name = str(torrent_id)
+    try:
+        await asyncio.to_thread(
+            get_torrent_connection().remove_torrent,
+            torrent_id,
+            delete_data=bot_config.get("transmission.delete_data"),
+        )
+    except Exception as err:  # noqa: BLE001
+        await context.bot.send_message(
+            chat_id=update.message.chat.id,
+            text=trans("SOMETHING_WENT_WRONG", lang_code) + f": {err}",
+        )
+        return
     await context.bot.send_message(
         chat_id=update.message.chat.id,
         text=trans("TORRENT_REMOVED", lang_code).format(escape_html(name)),
         parse_mode=ParseMode.HTML,
-    )
-    await asyncio.to_thread(
-        get_torrent_connection().remove_torrent,
-        torrent_id,
-        delete_data=bot_config.get("transmission.delete_data"),
     )
     DownloadQueue.remove(torrent_id)
     # 机器人里手动删的 FC2 任务也记黑名单，不然下一轮推送 / 再发磁力又加回来。

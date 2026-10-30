@@ -894,9 +894,15 @@ class Fc2Pusher:
             self.store.mark_retry(number)
             return False
 
-        tags, description_ja = _fetch_official_detail(number, proxy, verify_tls)
+        tags, description_ja = await asyncio.to_thread(
+            _fetch_official_detail, number, proxy, verify_tls
+        )
         censor = _censor_label(tags)
-        detail_zh = _translate_ja_to_zh(description_ja, proxy) if description_ja else ""
+        detail_zh = (
+            await asyncio.to_thread(_translate_ja_to_zh, description_ja, proxy)
+            if description_ja
+            else ""
+        )
         caption = _caption(entry, number, censor_label=censor, detail=detail_zh or description_ja)
         keyboard = _keyboard(number)
         # 卡片本体必须是「单张图片 + caption + 键盘」这种普通媒体消息。
