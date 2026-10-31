@@ -254,6 +254,121 @@ async def test_stalled_notification(env):
     assert any("没有进度" in message["text"] for message in bot.sent)
 
 
+async def test_fc2_bot_does_not_send_stalled_notice(env):
+    """FC2 专用机器人（fc2.enabled=true）不再发任何停滞提醒。"""
+    write_config(env, fc2={"enabled": True}, stalled_minutes=1)
+    torrent = FakeTorrent(name="FC2-PPV-5000545", percent_done=0.3)
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            last_progress_ts=time.time() - 7200,
+            last_progress_value=30.0,
+            progress_card=False,
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    assert bot.sent == []
+
+
+async def test_download_bot_still_sends_stalled_notice(env):
+    """下载机器人（fc2.enabled=false）的停滞提醒行为不变。"""
+    write_config(env, fc2={"enabled": False}, stalled_minutes=1)
+    torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            last_progress_ts=time.time() - 120,
+            last_progress_value=30.0,
+            progress_card=False,
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    stalled = [message for message in bot.sent if "没有进度" in message["text"]]
+    assert len(stalled) == 1
+    assert stalled[0]["chat_id"] == 9
+
+
+async def test_stalled_notice_is_throttled_to_once_per_six_hours(env, monkeypatch):
+    """同一任务 6 小时内最多一次；进度动一点又停也不许提前再发。"""
+    now = [10000.0]
+    monkeypatch.setattr("models.DownloadMonitor.time.time", lambda: now[0])
+    write_config(env, stalled_minutes=1)
+    torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            last_progress_ts=now[0] - 120,
+            last_progress_value=30.0,
+            progress_card=False,
+        )
+    )
+    monitor = DownloadMonitor(FakeClient(torrent), bot)
+
+    def stalled_messages():
+        return [message for message in bot.sent if "没有进度" in message["text"]]
+
+    await monitor.tick()
+    assert len(stalled_messages()) == 1
+    assert DownloadQueue.get(1).last_stalled_notify_ts == now[0]
+
+    # 进度动了 0.02%（>0.01% 复位阈值）后再次停滞：notified_stalled 复位，
+    # 但仍在上次提醒后的 6 小时内，不许再发。
+    torrent.percent_done = 0.3002
+    now[0] += 600
+    await monitor.tick()
+    assert DownloadQueue.get(1).notified_stalled is False
+
+    now[0] += 120
+    await monitor.tick()
+    assert len(stalled_messages()) == 1
+
+    # 距上次提醒满 6 小时后再次停滞：可以再发。
+    now[0] = DownloadQueue.get(1).last_stalled_notify_ts + 6 * 3600
+    await monitor.tick()
+    assert len(stalled_messages()) == 2
+
+
+async def test_stalled_threshold_minutes_still_configurable(env, monkeypatch):
+    """notify.stalled_minutes 仍是触发阈值：29 分钟不发，30 分钟才发。"""
+    now = [50000.0]
+    monkeypatch.setattr("models.DownloadMonitor.time.time", lambda: now[0])
+    write_config(env, stalled_minutes=30)
+    torrent = FakeTorrent(name="SSIS-123", percent_done=0.3)
+    bot = FakeBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            last_progress_ts=now[0] - 29 * 60,
+            last_progress_value=30.0,
+            progress_card=False,
+        )
+    )
+    monitor = DownloadMonitor(FakeClient(torrent), bot)
+
+    await monitor.tick()
+    assert bot.sent == []
+
+    now[0] += 60
+    await monitor.tick()
+    stalled = [message for message in bot.sent if "没有进度" in message["text"]]
+    assert len(stalled) == 1
+
+
 from telegram.error import TelegramError
 
 

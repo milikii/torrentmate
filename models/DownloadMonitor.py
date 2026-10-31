@@ -32,6 +32,10 @@ log = get_logger("DownloadMonitor")
 # 不写进 torrentino.yaml，避免动到用户配置项。
 ADOPT_BASELINE_FILE = "fc2_adopt_baseline.json"
 
+# 同一任务两次停滞提醒的最小间隔（秒）。进度动一点又停不算新的一轮，
+# 6 小时内不再提醒；超过后再次停滞才会再发。
+STALLED_NOTIFY_INTERVAL = 6 * 3600
+
 
 class DownloadMonitor:
     """定期轮询 Transmission，把状态变化推送给发起下载的用户。"""
@@ -61,6 +65,10 @@ class DownloadMonitor:
         self.pause_on_complete = bool(
             self.config.get("transmission.pause_on_complete", False)
         )
+        # FC2 专用机器人（fc2.enabled=true）只负责推送，不再发停滞提醒：
+        # 两个机器人各只有自己的 token，无法跨机器人发送；停滞提醒统一由
+        # 下载机器人（含它部署后接管的新 FC2 下载）发出。
+        self.fc2_enabled = bool(self.config.get("fc2.enabled", False))
         # FC2 任务通知分流：只有下载机器人（fc2.enabled=false）接管 FC2
         # 任务；fc2bot 配置里 fc2.enabled=true，永远不接管，避免两份通知。
         self.adopt_fc2 = bool(self.config.get("notify.adopt_fc2", True)) and not bool(
@@ -585,18 +593,28 @@ class DownloadMonitor:
                     DownloadQueue.update(entry)
 
     async def _check_stalled(self, torrent: Torrent, entry: QueueEntry) -> None:
-        if not self.stalled_minutes:
+        # FC2 专用机器人不发停滞提醒：这类任务要么由下载机器人接管后提醒，
+        # 要么（部署前就在 Fc2专用队列里的老任务）不再有停滞提醒。
+        if not self.stalled_minutes or self.fc2_enabled:
             return
+        now = time.time()
         percent = float(torrent.percent_done or 0) * 100
         if percent > float(entry.last_progress_value or 0) + 0.01:
             entry.last_progress_value = percent
-            entry.last_progress_ts = time.time()
+            entry.last_progress_ts = now
             entry.notified_stalled = False
             DownloadQueue.update(entry)
             return
         if entry.notified_stalled:
             return
-        idle = time.time() - float(entry.last_progress_ts or time.time())
+        # 按任务节流：进度动一点又停不算新的一轮，两次提醒至少间隔 6 小时，
+        # 否则“爬一点又停”的任务会反复复位再发。
+        # last_stalled_notify_ts 为 0/None 表示“从未提醒过”，必须跳过节流；
+        # 否则拿它跟 now 相减，在时间戳较小（如测试假时钟）时会把首条提醒吞掉。
+        last_notify_ts = float(entry.last_stalled_notify_ts or 0)
+        if last_notify_ts and now - last_notify_ts < STALLED_NOTIFY_INTERVAL:
+            return
+        idle = now - float(entry.last_progress_ts or now)
         if idle >= self.stalled_minutes * 60:
             speed = speed_to_human(torrent.rate_download)
             sent = await self._send(
@@ -610,6 +628,7 @@ class DownloadMonitor:
             )
             if sent is not None:
                 entry.notified_stalled = True
+                entry.last_stalled_notify_ts = now
                 DownloadQueue.update(entry)
 
     async def _send(self, entry: QueueEntry, text: str, reply_markup: Any = None):

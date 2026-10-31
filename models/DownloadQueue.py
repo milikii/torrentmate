@@ -43,6 +43,9 @@ class QueueEntry:
     last_classify_fail_ts: float = 0.0
     notified_error: bool = False
     notified_stalled: bool = False
+    # 上次停滞提醒的发送时间；同一任务两次提醒至少间隔 6 小时
+    # （见 DownloadMonitor.STALLED_NOTIFY_INTERVAL）。
+    last_stalled_notify_ts: float = 0.0
     last_progress_ts: float = field(default_factory=time.time)
     last_progress_value: float = -1.0
     finished: bool = False
