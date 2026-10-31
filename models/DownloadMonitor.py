@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import json
+import math
 import os
 import time
 from typing import Any
@@ -13,7 +16,7 @@ from telegram.error import TelegramError
 from transmission_rpc.torrent import Torrent
 
 from lib.classifier import get_classifier
-from lib.constants import PROGRESS_EDIT_INTERVAL, QUEUE_CHECK_INTERVAL
+from lib.constants import CONFIG_FILE, PROGRESS_EDIT_INTERVAL, QUEUE_CHECK_INTERVAL
 from lib.func import escape_html, get_logger, speed_to_human, trans
 from lib.render import render_done_card, render_progress_card
 from models.BotConfigurator import BotConfigurator
@@ -24,6 +27,10 @@ from models.Fc2Blacklist import config_path as blacklist_config_path
 from models.Fc2Channel import extract_number
 
 log = get_logger("DownloadMonitor")
+
+# 接管基线状态文件，和主配置文件同目录；只记录“从哪一刻开始接管”，
+# 不写进 torrentino.yaml，避免动到用户配置项。
+ADOPT_BASELINE_FILE = "fc2_adopt_baseline.json"
 
 
 class DownloadMonitor:
@@ -119,13 +126,21 @@ class DownloadMonitor:
             log.warning("接管 FC2 任务失败: %s", err)
 
     async def _adopt_fc2_torrents(self) -> None:
-        """把 tr-bt 里的未完成 FC2 任务接管进通知队列。
+        """把基线之后新加的未完成 FC2 任务接管进通知队列。
+
+        基线（ADOPT_BASELINE_FILE）在部署后第一次接管时以当前时间建立，
+        之后持久保存：只有 addedDate 晚于基线的任务才算“部署后新加”，
+        老任务一律不接管、不通知、不移动。
 
         只接管标题能提出严格 FC2 编号、且尚未完成/做种的任务：
         - 已完成任务不碰，完成卡发过、队列已清后不会被重新捡回来重发；
         - 已在队列里的（同 torrent_id 或同 info_hash）跳过；
         - 共享黑名单命中的跳过；黑名单读盘失败本轮也跳过，下轮再判。
         """
+        cutoff = self._ensure_adopt_baseline()
+        if cutoff is None:
+            return
+
         torrents = await asyncio.to_thread(self.client.get_torrents)
         if not torrents:
             return
@@ -135,7 +150,9 @@ class DownloadMonitor:
         known_hashes = {
             str(entry.info_hash).lower() for entry in queued.values() if entry.info_hash
         }
-        candidates = self._fc2_adopt_candidates(torrents, known_ids, known_hashes)
+        candidates = self._fc2_adopt_candidates(
+            torrents, known_ids, known_hashes, cutoff
+        )
         if not candidates:
             return
 
@@ -147,13 +164,97 @@ class DownloadMonitor:
         for torrent, number, torrent_hash in candidates:
             self._adopt_entry(torrent, number, torrent_hash, chat_id, blacklist)
 
+    def _adopt_baseline_path(self) -> str:
+        """接管基线状态文件：与主配置文件同目录（测试里随 config_file 走）。"""
+        config_file = getattr(BotConfigurator, "config_file", "") or CONFIG_FILE
+        return os.path.join(os.path.dirname(config_file) or ".", ADOPT_BASELINE_FILE)
+
+    def _ensure_adopt_baseline(self) -> float | None:
+        """读取接管基线；第一次运行时以当前时间建立并原子落盘。
+
+        基线文件缺失（首次部署）时写入当前时间，本轮不会有任务的
+        addedDate 晚于它，因此第一轮不接管任何已有任务。
+        文件存在但读不出/内容无效时返回 None（本轮不接管），绝不静默
+        重置基线——否则重启后老任务会被当成新任务重新接管。
+        """
+        path = self._adopt_baseline_path()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            raw = data["adopted_since"]
+            if isinstance(raw, bool):
+                raise TypeError("adopted_since 不是数字")
+            cutoff = float(raw)
+        except FileNotFoundError:
+            cutoff = time.time()
+            try:
+                self._write_adopt_baseline(path, cutoff)
+            except OSError as err:
+                log.warning("写入 FC2 接管基线失败: %s", err)
+                return None
+            log.info("FC2 接管基线已建立: %s", cutoff)
+            return cutoff
+        except (OSError, ValueError, TypeError, KeyError) as err:
+            log.error("读取 FC2 接管基线失败（%s），本轮不接管 FC2 任务", err)
+            return None
+        if not math.isfinite(cutoff) or cutoff < 0:
+            log.error("FC2 接管基线无效（%s），本轮不接管 FC2 任务", cutoff)
+            return None
+        return cutoff
+
+    @staticmethod
+    def _write_adopt_baseline(path: str, cutoff: float) -> None:
+        """原子写基线文件（临时文件 + os.replace）。"""
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "adopted_since": cutoff,
+                    "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+                fh,
+            )
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _torrent_added_timestamp(torrent: Torrent) -> float | None:
+        """取任务 addedDate 的 Unix 时间戳；拿不到时返回 None。
+
+        transmission-rpc 7.0.11 的 Torrent 暴露的是 ``added_date``
+        （RPC 字段 addedDate，datetime；本项目现有完成耗时计算也在用它）。
+        aware datetime 直接取绝对时间；naive datetime 按进程本地时区解释，
+        与 ``datetime.fromtimestamp(addedDate)`` 互为逆运算。其它类型一律
+        视为不可用，调用方据此跳过，宁可漏接管也不接管老任务。
+        """
+        try:
+            value = getattr(torrent, "added_date", None)
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(value, dt.datetime):
+            try:
+                return value.timestamp()
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return number if math.isfinite(number) else None
+        return None
+
     def _fc2_adopt_candidates(
         self,
         torrents: list[Torrent],
         known_ids: set[int],
         known_hashes: set[str],
+        cutoff: float,
     ) -> list[tuple[Torrent, str, str]]:
-        """挑出尚未在通知队列里的未完成 FC2 任务。"""
+        """挑出基线之后添加、尚未在通知队列里的未完成 FC2 任务。"""
         candidates: list[tuple[Torrent, str, str]] = []
         for torrent in torrents:
             # 防复活：只发现未完成任务，完成/做种中的一律不碰。
@@ -161,6 +262,10 @@ class DownloadMonitor:
                 continue
             number = extract_number(getattr(torrent, "name", "") or "")
             if not number:
+                continue
+            # 只接管部署基线之后新加的任务；添加时间不可用时也不接管。
+            added_at = self._torrent_added_timestamp(torrent)
+            if added_at is None or added_at <= cutoff:
                 continue
             torrent_hash = str(getattr(torrent, "info_hash", "") or "").lower()
             if torrent.id in known_ids:

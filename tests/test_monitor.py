@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import time
 from types import SimpleNamespace
@@ -10,9 +11,14 @@ from lib.classifier import DEFAULT_RULES
 from lib.func import trans
 from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
-from models.DownloadMonitor import DownloadMonitor
+from models.DownloadMonitor import ADOPT_BASELINE_FILE, DownloadMonitor
 from models.DownloadQueue import DownloadQueue, QueueEntry
 from models.Fc2Blacklist import Fc2Blacklist
+
+# 测试基线：视作 2026-10-01 部署，之后添加的 FC2 任务才算新任务。
+BASELINE_TS = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc).timestamp()
+NEW_ADDED = dt.datetime(2026, 10, 28, 11, 50, 0)  # naive，按本地时区解释
+OLD_ADDED = dt.datetime(2026, 9, 1, 12, 0, 0)
 
 
 class FakeTorrent:
@@ -128,6 +134,10 @@ def write_config(path, fc2=None, **notify_overrides):
 def env(tmp_path):
     path = tmp_path / "torrentino.yaml"
     write_config(path)
+    # 预置接管基线文件，避免每个旧用例都变成“部署第一轮”（不接管）。
+    (tmp_path / ADOPT_BASELINE_FILE).write_text(
+        json.dumps({"adopted_since": BASELINE_TS}), encoding="utf-8"
+    )
     original_file = BotConfigurator.config_file
     original_history = DownloadHistory.download_log_file
     BotConfigurator.config_file = str(path)
@@ -627,6 +637,7 @@ async def test_adopts_unfinished_fc2_torrent_and_notifies_super_user(env):
         download_dir="/downloads/未分类",
         percent_done=0.4,
         info_hash="D00C0FFEE",
+        added_date=NEW_ADDED,
     )
     client = FakeClient(torrent)
     bot = FakeBot()
@@ -657,13 +668,25 @@ async def test_non_fc2_torrent_is_not_adopted(env):
 async def test_finished_or_seeding_fc2_torrent_is_not_adopted(env):
     torrents = [
         FakeTorrent(
-            id=1, name="FC2-PPV-5000545", percent_done=1.0, status="seeding"
+            id=1,
+            name="FC2-PPV-5000545",
+            percent_done=1.0,
+            status="seeding",
+            added_date=NEW_ADDED,
         ),
         FakeTorrent(
-            id=2, name="FC2-PPV-5000546", percent_done=1.0, status="downloading"
+            id=2,
+            name="FC2-PPV-5000546",
+            percent_done=1.0,
+            status="downloading",
+            added_date=NEW_ADDED,
         ),
         FakeTorrent(
-            id=3, name="FC2-PPV-5000547", percent_done=0.99, status="seeding"
+            id=3,
+            name="FC2-PPV-5000547",
+            percent_done=0.99,
+            status="seeding",
+            added_date=NEW_ADDED,
         ),
     ]
     client = FakeClient(torrents=torrents)
@@ -684,7 +707,12 @@ async def test_blacklisted_fc2_torrent_is_not_adopted(env, tmp_path):
     )
     blacklist.add("5000545", "FC2-PPV-5000545 sample")
 
-    torrent = FakeTorrent(id=7, name="FC2-PPV-5000545 sample", percent_done=0.4)
+    torrent = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 sample",
+        percent_done=0.4,
+        added_date=NEW_ADDED,
+    )
     client = FakeClient(torrent)
     bot = FakeBot()
 
@@ -702,6 +730,7 @@ async def test_only_default_monitor_adopts_when_fc2_enabled_elsewhere(env):
         download_dir="/downloads/未分类",
         percent_done=0.4,
         info_hash="D00C0FFEE",
+        added_date=NEW_ADDED,
     )
 
     # fc2bot 视角：fc2.enabled=true，构造出的监控永远不接管。
@@ -735,6 +764,7 @@ async def test_already_queued_torrent_is_not_adopted_again(env):
         name="FC2-PPV-5000545 sample",
         percent_done=0.4,
         info_hash="D00C0FFEE",
+        added_date=NEW_ADDED,
     )
     DownloadQueue.add(
         QueueEntry(
@@ -752,3 +782,121 @@ async def test_already_queued_torrent_is_not_adopted_again(env):
     assert DownloadQueue.get(5).chat_id == 9
     assert len(bot.sent) == 1
     assert all(message["chat_id"] == 9 for message in bot.sent)
+
+
+async def test_fc2_torrent_added_before_baseline_is_not_adopted(env):
+    """部署前就存在的老任务：即使未完成、编号合法，也不接管。"""
+    torrent = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 old",
+        download_dir="/downloads/未分类",
+        percent_done=0.4,
+        info_hash="D00C0FFEE",
+        added_date=OLD_ADDED,
+    )
+    client = FakeClient(torrent)
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    assert DownloadQueue.size() == 0
+    assert bot.sent == []
+    assert client.moved == []
+
+
+@pytest.mark.parametrize("added_date", [None, "2026-10-28 11:50:00"])
+async def test_fc2_torrent_without_usable_added_date_is_not_adopted(env, added_date):
+    """添加时间缺失/类型不可用时 fail-safe：宁可不接管。"""
+    torrent = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 sample",
+        download_dir="/downloads/未分类",
+        percent_done=0.4,
+        info_hash="D00C0FFEE",
+        added_date=added_date,
+    )
+    client = FakeClient(torrent)
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    assert DownloadQueue.size() == 0
+    assert bot.sent == []
+    assert client.moved == []
+
+
+async def test_adopt_baseline_is_created_on_first_tick_and_persists(env, tmp_path):
+    """首轮建立基线且不接管老任务；重启读同一文件，老任务仍不接管。"""
+    baseline_file = tmp_path / ADOPT_BASELINE_FILE
+    baseline_file.unlink()  # 模拟全新部署：还没有基线文件
+    now = dt.datetime.now(dt.timezone.utc)
+    old = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 old",
+        download_dir="/downloads/未分类",
+        percent_done=0.4,
+        info_hash="OLDHASH",
+        added_date=now - dt.timedelta(hours=1),
+    )
+    old_bot = FakeBot()
+    old_client = FakeClient(old)
+
+    await DownloadMonitor(old_client, old_bot).tick()
+
+    # 第一轮：基线以当前时间建立，已有任务全部算老任务。
+    assert DownloadQueue.size() == 0
+    assert old_bot.sent == []
+    assert old_client.moved == []
+    assert baseline_file.exists()
+    cutoff = json.loads(baseline_file.read_text(encoding="utf-8"))["adopted_since"]
+    assert cutoff > 0
+
+    # 模拟监控重启：新实例读同一个状态文件。
+    DownloadQueue.clear()
+    new = FakeTorrent(
+        id=8,
+        name="FC2-PPV-5000546 new",
+        download_dir="/downloads/未分类",
+        percent_done=0.3,
+        info_hash="NEWHASH",
+        added_date=dt.datetime.fromtimestamp(cutoff + 60, dt.timezone.utc),
+    )
+    bot = FakeBot()
+    client = FakeClient(torrents=[old, new])
+
+    await DownloadMonitor(client, bot).tick()
+
+    assert DownloadQueue.get(7) is None
+    assert DownloadQueue.get(8) is not None
+    assert client.moved == ["/downloads/FC2"]
+    assert any("FC2-PPV-5000546" in message["text"] for message in bot.sent)
+
+
+async def test_readded_torrent_with_same_info_hash_is_adopted(env):
+    """同一内容删了重加：addedDate 是新的，不因旧任务出现过同 hash 被拦。"""
+    old = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 sample",
+        download_dir="/downloads/未分类",
+        percent_done=1.0,
+        status="seeding",
+        info_hash="D00C0FFEE",
+        added_date=OLD_ADDED,
+    )
+    new = FakeTorrent(
+        id=9,
+        name="FC2-PPV-5000545 sample",
+        download_dir="/downloads/未分类",
+        percent_done=0.2,
+        info_hash="D00C0FFEE",
+        added_date=NEW_ADDED,
+    )
+    client = FakeClient(torrents=[old, new])
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    entry = DownloadQueue.get(9)
+    assert entry is not None
+    assert entry.info_hash == "d00c0ffee"
+    assert DownloadQueue.get(7) is None
