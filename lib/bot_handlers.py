@@ -1128,6 +1128,8 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("这条已过期")
         return
     # 极简：进度卡片由 DownloadMonitor 发到私聊，频道卡片不动。
+    # notify=False：本容器的通知队列不记这条，交给下载机器人（torrentino）
+    # 发现并推送，避免 fc2bot 自己再发一份。
     try:
         await asyncio.to_thread(
             get_torrent_connection().add_torrent,
@@ -1138,6 +1140,7 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title=entry.get("title"),
             auto_classify=True,
             single_dedup=True,
+            notify=False,
         )
     except TorrentAlreadyExists:
         await query.answer("已经下过了")

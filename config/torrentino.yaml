@@ -94,6 +94,10 @@ notify:
   milestones: []
   # 超过多少分钟没有进度就提醒一次，0 表示关闭
   stalled_minutes: 30
+  # FC2 频道下载的通知分流：下载机器人（fc2.enabled=false）负责发现并接管
+  # FC2 任务，进度/完成/归类通知统一发到 bot.super_user 私聊；fc2bot 的配置里
+  # fc2.enabled=true，会自动跳过接管，避免两边各发一份。
+  adopt_fc2: true
 
 # 站点账号：默认只启用 rutor，其它站点需要注册后填账号并设置 enabled: true
 trackers:

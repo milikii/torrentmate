@@ -19,6 +19,9 @@ from lib.render import render_done_card, render_progress_card
 from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue, QueueEntry
+from models.Fc2Blacklist import Fc2Blacklist
+from models.Fc2Blacklist import config_path as blacklist_config_path
+from models.Fc2Channel import extract_number
 
 log = get_logger("DownloadMonitor")
 
@@ -51,6 +54,12 @@ class DownloadMonitor:
         self.pause_on_complete = bool(
             self.config.get("transmission.pause_on_complete", False)
         )
+        # FC2 任务通知分流：只有下载机器人（fc2.enabled=false）接管 FC2
+        # 任务；fc2bot 配置里 fc2.enabled=true，永远不接管，避免两份通知。
+        self.adopt_fc2 = bool(self.config.get("notify.adopt_fc2", True)) and not bool(
+            self.config.get("fc2.enabled", False)
+        )
+        self._super_user_warned = False
 
     async def run(self) -> None:
         log.info("下载监控已启动，轮询间隔 %s 秒", self.interval)
@@ -64,6 +73,9 @@ class DownloadMonitor:
             await asyncio.sleep(self.interval)
 
     async def tick(self) -> None:
+        # 先发现再取快照：刚接管的 FC2 任务同一轮就能发出第一张卡。
+        # 发现失败只记日志，不能影响原有队列的处理。
+        await self._maybe_adopt_fc2()
         entries = DownloadQueue.snapshot()
         if not entries:
             return
@@ -94,6 +106,107 @@ class DownloadMonitor:
                 await self.handle(torrent, entry)
             except Exception as err:  # noqa: BLE001
                 log.exception("处理任务 %s 通知失败: %s", torrent_id, err)
+
+    async def _maybe_adopt_fc2(self) -> None:
+        """接管 FC2 任务；失败只记日志，不影响原有队列的处理。"""
+        if not self.adopt_fc2:
+            return
+        try:
+            await self._adopt_fc2_torrents()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            log.warning("接管 FC2 任务失败: %s", err)
+
+    async def _adopt_fc2_torrents(self) -> None:
+        """把 tr-bt 里的未完成 FC2 任务接管进通知队列。
+
+        只接管标题能提出严格 FC2 编号、且尚未完成/做种的任务：
+        - 已完成任务不碰，完成卡发过、队列已清后不会被重新捡回来重发；
+        - 已在队列里的（同 torrent_id 或同 info_hash）跳过；
+        - 共享黑名单命中的跳过；黑名单读盘失败本轮也跳过，下轮再判。
+        """
+        torrents = await asyncio.to_thread(self.client.get_torrents)
+        if not torrents:
+            return
+
+        queued = DownloadQueue.snapshot()
+        known_ids = set(queued)
+        known_hashes = {
+            str(entry.info_hash).lower() for entry in queued.values() if entry.info_hash
+        }
+        candidates = self._fc2_adopt_candidates(torrents, known_ids, known_hashes)
+        if not candidates:
+            return
+
+        chat_id = self._adopt_chat_id()
+        if chat_id is None:
+            return
+
+        blacklist = Fc2Blacklist(blacklist_config_path(BotConfigurator()))
+        for torrent, number, torrent_hash in candidates:
+            self._adopt_entry(torrent, number, torrent_hash, chat_id, blacklist)
+
+    def _fc2_adopt_candidates(
+        self,
+        torrents: list[Torrent],
+        known_ids: set[int],
+        known_hashes: set[str],
+    ) -> list[tuple[Torrent, str, str]]:
+        """挑出尚未在通知队列里的未完成 FC2 任务。"""
+        candidates: list[tuple[Torrent, str, str]] = []
+        for torrent in torrents:
+            # 防复活：只发现未完成任务，完成/做种中的一律不碰。
+            if float(torrent.percent_done or 0) >= 1 or torrent.status == "seeding":
+                continue
+            number = extract_number(getattr(torrent, "name", "") or "")
+            if not number:
+                continue
+            torrent_hash = str(getattr(torrent, "info_hash", "") or "").lower()
+            if torrent.id in known_ids:
+                continue
+            if torrent_hash and torrent_hash in known_hashes:
+                continue
+            candidates.append((torrent, number, torrent_hash))
+        return candidates
+
+    def _adopt_chat_id(self) -> int | None:
+        """取接管通知的接收 chat；未配置 bot.super_user 时每轮只警告一次。"""
+        try:
+            chat_id = int(self.config.get("bot.super_user"))
+        except (TypeError, ValueError):
+            chat_id = None
+        if chat_id is not None:
+            return chat_id
+        if not self._super_user_warned:
+            log.warning("未配置 bot.super_user，本轮不接管 FC2 任务")
+            self._super_user_warned = True
+        return None
+
+    def _adopt_entry(
+        self,
+        torrent: Torrent,
+        number: str,
+        torrent_hash: str,
+        chat_id: int,
+        blacklist: Fc2Blacklist,
+    ) -> None:
+        """黑名单通过后把任务加进通知队列。"""
+        record, read_ok = blacklist.lookup(number)
+        if record is not None or not read_ok:
+            return
+        entry = QueueEntry(
+            torrent_id=int(torrent.id),
+            chat_id=chat_id,
+            lang_code="zh",
+            title=str(torrent.name or ""),
+            requested_dir=str(torrent.download_dir or ""),
+            info_hash=torrent_hash or None,
+            auto_classify=True,
+        )
+        if not DownloadQueue.add_if_new(entry):
+            return
+        log.info("接管 FC2 任务 %s（编号 %s）", torrent.name, number)
 
     async def handle(self, torrent: Torrent, entry: QueueEntry) -> None:
         # 1. 任务出错，只提醒一次：先发送，确认送达才标记已通知，

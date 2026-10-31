@@ -210,3 +210,41 @@ def test_default_mode_skips_dedup_and_keeps_original_add_semantics(monkeypatch):
     assert entry is not None
     assert entry.message_id is None
     assert entry.info_hash == "a" * 40
+
+
+def test_notify_false_adds_torrent_without_queue_entry(monkeypatch):
+    info_hash = "0123456789abcdef0123456789abcdef01234567"
+    result = SimpleNamespace(id=3, name="fc2", info_hash=info_hash)
+    client, calls = make_client(monkeypatch, [], add_result=result)
+
+    returned = client.add_torrent(
+        9,
+        "zh",
+        "https://tracker.invalid/dl/3",
+        single_dedup=True,
+        notify=False,
+    )
+
+    assert returned is result
+    assert len(calls) == 1
+    assert DownloadQueue.size() == 0
+
+
+def test_notify_false_still_dedups_against_transmission_after_add(monkeypatch):
+    info_hash = "89abcdef0123456789abcdef0123456789abcdef"
+    result = SimpleNamespace(id=2, name="existing", info_hash=info_hash.upper())
+    client, calls = make_client(
+        monkeypatch, [remote(2, info_hash)], add_result=result
+    )
+
+    with pytest.raises(TorrentAlreadyExists):
+        client.add_torrent(
+            9,
+            "zh",
+            "https://tracker.invalid/dl/2",
+            single_dedup=True,
+            notify=False,
+        )
+
+    assert len(calls) == 1
+    assert DownloadQueue.size() == 0

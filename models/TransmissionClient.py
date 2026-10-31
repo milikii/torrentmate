@@ -64,9 +64,14 @@ class TransmissionClient(Client):
         auto_classify: bool = False,
         message_id: int | None = None,
         single_dedup: bool = False,
+        notify: bool = True,
         **kwargs: Any,
     ) -> Torrent:
-        """添加任务并把通知信息写入下载队列。"""
+        """添加任务并把通知信息写入下载队列。
+
+        notify=False 时只往 tr-bt 加任务、不写通知队列（由别的机器人
+        负责发现并推送）；single_dedup 的前后两次查重语义保持不变。
+        """
         if download_dir:
             kwargs["download_dir"] = download_dir
         existing: dict[str, Torrent] = {}
@@ -92,6 +97,13 @@ class TransmissionClient(Client):
         _torrent = super().add_torrent(torrent, **kwargs)
         actual_hash = str(getattr(_torrent, "info_hash", "") or "").lower()
 
+        # 查重要在决定是否写队列之前完成：notify=False 也必须按 tr-bt
+        # 实际 hash 判重，重复照样抛 TorrentAlreadyExists。
+        if single_dedup and actual_hash and actual_hash in existing:
+            raise TorrentAlreadyExists(actual_hash)
+        if not notify:
+            return _torrent
+
         entry = QueueEntry(
             torrent_id=_torrent.id,
             chat_id=int(chat_id),
@@ -104,8 +116,6 @@ class TransmissionClient(Client):
             final_dir=str(download_dir) if download_dir else None,
         )
         if single_dedup:
-            if actual_hash and actual_hash in existing:
-                raise TorrentAlreadyExists(actual_hash)
             if not DownloadQueue.add_if_new(entry):
                 raise TorrentAlreadyExists(actual_hash)
         else:

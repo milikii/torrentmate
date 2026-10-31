@@ -1,4 +1,5 @@
 import datetime as dt
+import os
 import time
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
 from models.DownloadMonitor import DownloadMonitor
 from models.DownloadQueue import DownloadQueue, QueueEntry
+from models.Fc2Blacklist import Fc2Blacklist
 
 
 class FakeTorrent:
@@ -58,14 +60,27 @@ class FakeBot:
 
 
 class FakeClient:
-    def __init__(self, torrent):
+    def __init__(self, torrent=None, torrents=None):
         self.torrent = torrent
+        self.torrents = (
+            list(torrents)
+            if torrents is not None
+            else ([torrent] if torrent is not None else [])
+        )
         self.moved = []
         self.data_moved = []
         self.stopped = []
 
+    def get_torrents(self):
+        return list(self.torrents)
+
     def get_torrent(self, torrent_id):
-        return self.torrent
+        for torrent in self.torrents:
+            if torrent.id == torrent_id:
+                return torrent
+        if self.torrent is not None:
+            return self.torrent
+        raise KeyError(torrent_id)
 
     def change_torrent(self, torrent_id, location=None, **kwargs):
         self.moved.append(location)
@@ -77,7 +92,7 @@ class FakeClient:
         self.stopped.append(torrent_id)
 
 
-def write_config(path, **notify_overrides):
+def write_config(path, fc2=None, **notify_overrides):
     data = {
         "bot": {"token": "token", "super_user": 1},
         "transmission": {"pause_on_complete": False},
@@ -102,6 +117,8 @@ def write_config(path, **notify_overrides):
             **notify_overrides,
         },
     }
+    if fc2 is not None:
+        data["fc2"] = fc2
     path.write_text(
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
@@ -598,3 +615,140 @@ async def test_failed_milestone_is_retried_when_card_text_is_identical(env):
     assert DownloadQueue.get(1).milestones_sent == {25}
     assert len(bot.sent) == 2
     assert bot.edits == []
+
+
+# ---------------------------------------------------------------- FC2 任务接管
+
+
+async def test_adopts_unfinished_fc2_torrent_and_notifies_super_user(env):
+    torrent = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 sample",
+        download_dir="/downloads/未分类",
+        percent_done=0.4,
+        info_hash="D00C0FFEE",
+    )
+    client = FakeClient(torrent)
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    entry = DownloadQueue.get(7)
+    assert entry is not None
+    assert entry.chat_id == 1  # bot.super_user
+    assert entry.auto_classify is True
+    assert entry.info_hash == "d00c0ffee"
+    assert client.moved == ["/downloads/FC2"]
+    assert any("FC2-PPV-5000545" in message["text"] for message in bot.sent)
+
+
+async def test_non_fc2_torrent_is_not_adopted(env):
+    torrent = FakeTorrent(id=7, name="SSIS-123", percent_done=0.4)
+    client = FakeClient(torrent)
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    assert DownloadQueue.size() == 0
+    assert bot.sent == []
+    assert client.moved == []
+
+
+async def test_finished_or_seeding_fc2_torrent_is_not_adopted(env):
+    torrents = [
+        FakeTorrent(
+            id=1, name="FC2-PPV-5000545", percent_done=1.0, status="seeding"
+        ),
+        FakeTorrent(
+            id=2, name="FC2-PPV-5000546", percent_done=1.0, status="downloading"
+        ),
+        FakeTorrent(
+            id=3, name="FC2-PPV-5000547", percent_done=0.99, status="seeding"
+        ),
+    ]
+    client = FakeClient(torrents=torrents)
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    assert DownloadQueue.size() == 0
+    assert bot.sent == []
+    assert client.moved == []
+
+
+async def test_blacklisted_fc2_torrent_is_not_adopted(env, tmp_path):
+    blacklist_path = tmp_path / "fc2_blacklist.json"
+    write_config(env, fc2={"blacklist_file": str(blacklist_path)})
+    blacklist = Fc2Blacklist(
+        str(blacklist_path), state_path=str(tmp_path / "fc2_state.json")
+    )
+    blacklist.add("5000545", "FC2-PPV-5000545 sample")
+
+    torrent = FakeTorrent(id=7, name="FC2-PPV-5000545 sample", percent_done=0.4)
+    client = FakeClient(torrent)
+    bot = FakeBot()
+
+    await DownloadMonitor(client, bot).tick()
+
+    assert DownloadQueue.size() == 0
+    assert bot.sent == []
+    assert client.moved == []
+
+
+async def test_only_default_monitor_adopts_when_fc2_enabled_elsewhere(env):
+    torrent = FakeTorrent(
+        id=7,
+        name="FC2-PPV-5000545 sample",
+        download_dir="/downloads/未分类",
+        percent_done=0.4,
+        info_hash="D00C0FFEE",
+    )
+
+    # fc2bot 视角：fc2.enabled=true，构造出的监控永远不接管。
+    write_config(env, fc2={"enabled": True})
+    fc2_bot = FakeBot()
+    fc2_monitor = DownloadMonitor(FakeClient(torrent), fc2_bot)
+
+    # 下载机器人视角：默认配置。
+    write_config(env)
+    default_bot = FakeBot()
+    default_client = FakeClient(torrent)
+    default_monitor = DownloadMonitor(default_client, default_bot)
+    # 两个实例共享同一个配置文件路径，冻结 fc2bot 实例的配置缓存，
+    # 免得 tick 时按 mtime 重载成默认配置。
+    fc2_monitor.config._config_mtime = os.path.getmtime(str(env))
+
+    await fc2_monitor.tick()
+    await default_monitor.tick()
+
+    assert fc2_bot.sent == []
+    assert fc2_bot.edits == []
+    assert DownloadQueue.size() == 1
+    assert DownloadQueue.get(7).chat_id == 1
+    assert default_bot.sent
+    assert default_client.moved == ["/downloads/FC2"]
+
+
+async def test_already_queued_torrent_is_not_adopted_again(env):
+    torrent = FakeTorrent(
+        id=5,
+        name="FC2-PPV-5000545 sample",
+        percent_done=0.4,
+        info_hash="D00C0FFEE",
+    )
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=5,
+            chat_id=9,
+            lang_code="zh",
+            info_hash="d00c0ffee",
+        )
+    )
+    bot = FakeBot()
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    assert DownloadQueue.size() == 1
+    assert DownloadQueue.get(5).chat_id == 9
+    assert len(bot.sent) == 1
+    assert all(message["chat_id"] == 9 for message in bot.sent)

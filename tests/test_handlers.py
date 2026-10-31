@@ -773,6 +773,26 @@ async def test_fc2_download_adds_magnet_to_private_chat(env, tmp_path, monkeypat
     assert answers == ["已开始下载"]
 
 
+async def test_fc2_download_does_not_write_fc2bot_queue(env, tmp_path, monkeypatch):
+    """fc2bot 只负责加任务：不写自己的通知队列，也不发任何下载通知。"""
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    update, answers = make_fc2_callback("fc2dl:5000545")
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == ["已开始下载"]
+    assert len(env.client.added) == 1
+    assert env.client.added[0]["notify"] is False
+    assert DownloadQueue.size() == 0
+    assert env.bot.sent == []
+    assert env.bot.edits == []
+
+
 async def test_fc2_download_reports_duplicate_without_card(env, tmp_path, monkeypatch):
     store = install_fc2_store(monkeypatch, tmp_path)
     store.remember(
