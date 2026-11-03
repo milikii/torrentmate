@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 
 import pydash as _
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -1113,6 +1113,68 @@ def _fc2_records() -> list[dict]:
     return records
 
 
+FC2_DOWNLOADED_LABEL = "✅已添加任务"
+
+
+def _fc2_downloaded_markup(markup, number: str):
+    """复制卡片现有键盘，只把这一条卡片的下载按钮换成「已添加」样式。
+
+    不拿 _keyboard() 重建整副键盘：旧卡片实际发出的键盘可能和新模板
+    对不上，复制现成的键盘才能保证其它按钮和布局原样保留。没有键盘、
+    或键盘里找不到这一条的下载按钮时返回 None，调用方跳过编辑。
+    """
+    rows = getattr(markup, "inline_keyboard", None)
+    if not rows:
+        return None
+    target = f"fc2dl:{number}"
+    changed = False
+    new_rows = []
+    for row in rows:
+        new_row = []
+        for button in row:
+            if getattr(button, "callback_data", None) == target:
+                if getattr(button, "text", None) == FC2_DOWNLOADED_LABEL:
+                    # 已经标过（例如重复点击）：不用再改，返回 None 让调用方跳过。
+                    new_row.append(button)
+                    continue
+                new_row.append(
+                    InlineKeyboardButton(
+                        FC2_DOWNLOADED_LABEL, callback_data=button.callback_data
+                    )
+                )
+                changed = True
+            else:
+                new_row.append(button)
+        new_rows.append(new_row)
+    return InlineKeyboardMarkup(new_rows) if changed else None
+
+
+async def _mark_fc2_downloaded(bot, query, number: str) -> None:
+    """把回调所在卡片的下载按钮改成「已添加」；纯装饰，失败只记日志。
+
+    编辑对象就是回调所在的那条消息本身，私聊和旧频道卡片都一样；
+    消息已删、权限不足、网络抖动都不能影响已经建好的下载任务，也不给
+    用户多发消息。
+    """
+    message = getattr(query, "message", None)
+    if message is None:
+        log.warning("FC2 卡片按钮更新跳过：回调消息不存在 %s", number)
+        return
+    try:
+        markup = _fc2_downloaded_markup(
+            getattr(message, "reply_markup", None), number
+        )
+        if markup is None:
+            return
+        await bot.edit_message_reply_markup(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reply_markup=markup,
+        )
+    except Exception as err:  # noqa: BLE001
+        log.warning("FC2 卡片下载按钮更新失败 %s: %s", number, err)
+
+
 async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """频道卡片「下载」：现场拼 nyaa 磁力，走现有单条添加流程。"""
     query = update.callback_query
@@ -1127,7 +1189,9 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not entry:
         await query.answer("这条已过期")
         return
-    # 极简：进度卡片由 DownloadMonitor 发到私聊，频道卡片不动。
+    # 进度卡片由 DownloadMonitor 发到私聊；这张订阅卡片只在确认任务已经进
+    # 下载器之后，把下载按钮改成「✅已添加任务」（重复点击也如实标上），
+    # 其余按钮和卡片文案都不动。黑名单、过期、添加失败时不改按钮。
     # notify=False：本容器的通知队列不记这条，交给下载机器人（torrentino）
     # 发现并推送，避免 fc2bot 自己再发一份。
     try:
@@ -1143,12 +1207,17 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notify=False,
         )
     except TorrentAlreadyExists:
+        # 任务已经在下载器里：旧卡片晚点再点、或上次改按钮失败后重进，
+        # 这里也把按钮补成「已添加」，让卡片和真实状态对齐。重复点击
+        # 靠单条去重保证绝不会再建一份任务。
+        await _mark_fc2_downloaded(context.bot, query, number)
         await query.answer("已经下过了")
         return
     except Exception as err:  # noqa: BLE001
         log.error("FC2 下载添加失败 %s: %s", number, err)
         await query.answer("添加失败")
         return
+    await _mark_fc2_downloaded(context.bot, query, number)
     await query.answer("已开始下载")
 
 

@@ -719,7 +719,7 @@ def install_fc2_store(monkeypatch, tmp_path):
     return store
 
 
-def make_fc2_callback(data, user_id=9):
+def make_fc2_callback(data, user_id=9, reply_markup=None):
     answers = []
 
     async def answer(text=None, *args, **kwargs):
@@ -728,7 +728,11 @@ def make_fc2_callback(data, user_id=9):
     query = SimpleNamespace(
         data=data,
         from_user=SimpleNamespace(id=user_id, language_code="zh-hans"),
-        message=SimpleNamespace(chat=SimpleNamespace(id=user_id), message_id=77),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=user_id),
+            message_id=77,
+            reply_markup=reply_markup,
+        ),
         answer=answer,
         edit_message_reply_markup=_async_noop,
     )
@@ -812,6 +816,195 @@ async def test_fc2_download_reports_duplicate_without_card(env, tmp_path, monkey
     assert answers == ["已经下过了"]
     assert env.bot.sent == []
     assert env.bot.edits == []
+
+
+def fc2_card_markup(number="5000545"):
+    """和推送器实际发出去的一样：下载 / 不感兴趣 / 官网 三颗按钮。"""
+    return fc2._keyboard(number)
+
+
+def assert_single_download_button_marked(env, original):
+    assert len(env.bot.keyboard_clears) == 1
+    chat_id, message_id, markup = env.bot.keyboard_clears[0]
+    assert (chat_id, message_id) == (9, 77)
+    rows = markup.inline_keyboard
+    original_rows = original.inline_keyboard
+    assert len(rows) == len(original_rows) == 2
+    assert [len(row) for row in rows] == [len(row) for row in original_rows]
+    download, mute = rows[0]
+    assert download.text == "✅已添加任务"
+    assert download.callback_data == "fc2dl:5000545"
+    # 不感兴趣、官网按钮原样保留，布局不变
+    assert mute.text == original_rows[0][1].text
+    assert mute.callback_data == original_rows[0][1].callback_data
+    assert rows[1][0].text == original_rows[1][0].text
+    assert rows[1][0].url == original_rows[1][0].url
+
+
+async def test_fc2_download_marks_card_button_after_add_success(
+    env, tmp_path, monkeypatch
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    keyboard = fc2_card_markup()
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=keyboard)
+    context = SimpleNamespace(user_data={}, bot=env.bot)
+
+    await handlers.fc2_download(update, context)
+
+    assert len(env.client.added) == 1
+    assert answers == ["已开始下载"]
+    assert env.bot.sent == []
+    assert_single_download_button_marked(env, keyboard)
+
+
+async def test_fc2_download_marks_card_button_on_duplicate(env, tmp_path, monkeypatch):
+    """重复点击不重复建任务，也把按钮补成「已添加」对齐真实状态。"""
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    calls = []
+
+    def duplicate(**kwargs):
+        calls.append(kwargs)
+        raise handlers.TorrentAlreadyExists(FC2_HASH)
+
+    monkeypatch.setattr(env.client, "add_torrent", duplicate)
+    keyboard = fc2_card_markup()
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=keyboard)
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert len(calls) == 1
+    assert env.client.added == []
+    assert answers == ["已经下过了"]
+    assert env.bot.sent == []
+    assert_single_download_button_marked(env, keyboard)
+
+
+async def test_fc2_download_already_marked_button_is_left_alone(
+    env, tmp_path, monkeypatch
+):
+    """按钮已经是 ✅ 时重复点击不再发编辑请求（避免 not modified 噪声）。"""
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+
+    def duplicate(**kwargs):
+        raise handlers.TorrentAlreadyExists(FC2_HASH)
+
+    monkeypatch.setattr(env.client, "add_torrent", duplicate)
+    keyboard = handlers._fc2_downloaded_markup(fc2_card_markup(), "5000545")
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=keyboard)
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == ["已经下过了"]
+    assert env.bot.keyboard_clears == []
+    assert env.client.added == []
+
+
+async def test_fc2_download_blacklisted_leaves_card_button(env, tmp_path, monkeypatch):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    blacklist = install_fc2_blacklist(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    blacklist.add("5000545", "FC2-PPV-5000545 sample", fc2bl.SOURCE_MUTE)
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=fc2_card_markup())
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert env.client.added == []
+    assert answers == ["这个你拉黑过，已跳过"]
+    assert env.bot.keyboard_clears == []
+
+
+async def test_fc2_download_expired_leaves_card_button(env, tmp_path, monkeypatch):
+    install_fc2_store(monkeypatch, tmp_path)
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=fc2_card_markup())
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert env.client.added == []
+    assert answers == ["这条已过期"]
+    assert env.bot.keyboard_clears == []
+
+
+async def test_fc2_download_add_failure_leaves_card_button(env, tmp_path, monkeypatch):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError("transmission is down")
+
+    monkeypatch.setattr(env.client, "add_torrent", boom)
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=fc2_card_markup())
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert answers == ["添加失败"]
+    assert env.bot.keyboard_clears == []
+    assert env.bot.sent == []
+
+
+async def test_fc2_download_keyboard_edit_failure_keeps_success(
+    env, tmp_path, monkeypatch
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+
+    async def broken(chat_id, message_id, reply_markup=None):
+        raise BadRequest("Message to edit not found")
+
+    monkeypatch.setattr(env.bot, "edit_message_reply_markup", broken)
+    update, answers = make_fc2_callback("fc2dl:5000545", reply_markup=fc2_card_markup())
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert len(env.client.added) == 1
+    assert answers == ["已开始下载"]
+    assert env.bot.sent == []
+
+
+async def test_fc2_download_missing_callback_message_keeps_success(
+    env, tmp_path, monkeypatch
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    update, answers = make_fc2_callback("fc2dl:5000545")
+    update.callback_query.message = None
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert len(env.client.added) == 1
+    assert answers == ["已开始下载"]
+    assert env.bot.keyboard_clears == []
+    assert env.bot.sent == []
 
 
 async def test_fc2_mute_deletes_all_cards_and_persists(env, tmp_path, monkeypatch):
