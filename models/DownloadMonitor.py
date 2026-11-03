@@ -20,6 +20,14 @@ from lib.constants import CONFIG_FILE, PROGRESS_EDIT_INTERVAL, QUEUE_CHECK_INTER
 from lib.func import escape_html, get_logger, speed_to_human, trans
 from lib.render import render_done_card, render_progress_card
 from models.BotConfigurator import BotConfigurator
+from models.DoneList import (
+    SOURCE_UNKNOWN,
+    WRITE_FAILED,
+    DoneDeletionQueue,
+    DoneList,
+    config_path as done_config_path,
+    pending_config_path as done_pending_config_path,
+)
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue, QueueEntry
 from models.Fc2Blacklist import Fc2Blacklist
@@ -74,6 +82,10 @@ class DownloadMonitor:
         self.adopt_fc2 = bool(self.config.get("notify.adopt_fc2", True)) and not bool(
             self.config.get("fc2.enabled", False)
         )
+        # 成功名单与待删卡片队列都落共享目录：两个机器人配同一个
+        # fc2.done_file 就能查到同一份记录；待删文件默认紧挨着它。
+        self.done_list = DoneList(done_config_path(self.config))
+        self.done_deletions = DoneDeletionQueue(done_pending_config_path(self.config))
         self._super_user_warned = False
 
     async def run(self) -> None:
@@ -316,6 +328,8 @@ class DownloadMonitor:
             requested_dir=str(torrent.download_dir or ""),
             info_hash=torrent_hash or None,
             auto_classify=True,
+            # 接管进来的任务不是用户此刻主动添加的，来源无法判定，记 unknown。
+            source=SOURCE_UNKNOWN,
         )
         if not DownloadQueue.add_if_new(entry):
             return
@@ -418,20 +432,61 @@ class DownloadMonitor:
         return True
 
     async def _complete(self, torrent: Torrent, entry: QueueEntry) -> None:
-        elapsed = None
-        try:
-            if torrent.done_date and torrent.added_date:
-                elapsed = (torrent.done_date - torrent.added_date).total_seconds()
-        except Exception:  # noqa: BLE001
-            elapsed = None
-
+        elapsed = self._elapsed_seconds(torrent)
         text = render_done_card(torrent, entry.lang_code, None, elapsed)
         keyboard = self._done_keyboard(torrent, entry.lang_code)
         log.info("下载完成: %s -> %s", torrent.name, torrent.download_dir)
 
         # 先确认完成卡片真的送达，再写历史、清队列：之前是先标记
         # finished、直接清队列，发送失败时完成通知就永久丢失了。
-        delivered = False
+        delivered, delete_message_id = await self._deliver_done_card(
+            entry, text, keyboard
+        )
+        if not delivered:
+            log.warning("完成卡片发送失败，任务 %s 保留在队列中下轮重试", torrent.id)
+            # 通知失败也不能跳过暂停：否则任务会一直做种，
+            # 原来的 pause_on_complete 开关就失效了。
+            await self._pause_after_complete(torrent)
+            return
+
+        entry.finished = True
+        DownloadHistory.add(
+            torrent.done_date,
+            torrent.name,
+            torrent.download_dir,
+            torrent.size_when_done,
+        )
+        # 成功名单只在这里写：完成卡没送达时上面已经 return，不会写。
+        self._record_done(torrent, entry)
+        DownloadQueue.remove(torrent.id)
+
+        # 只删“原地编辑成完成卡”的那条旧进度卡；新发的完成消息是用户
+        # 唯一的完成提醒，必须留着。删卡失败只记日志，不影响已经写好的
+        # 历史和成功名单。
+        await self._delete_card(entry.chat_id, delete_message_id)
+
+        if self.pause_on_complete and torrent.status == "seeding":
+            await self._pause_and_notify(torrent, entry)
+
+    @staticmethod
+    def _elapsed_seconds(torrent: Torrent) -> float | None:
+        try:
+            if torrent.done_date and torrent.added_date:
+                return (torrent.done_date - torrent.added_date).total_seconds()
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    async def _deliver_done_card(self, entry: QueueEntry, text, keyboard):
+        """发送（或原地更新）完成卡，返回（是否送达, 完成后可删的消息 id）。
+
+        只有把原进度卡原地编辑成完成卡时，才返回这条旧卡片的 id（之后
+        可以删）。以下情况都返回 None，新发的完成消息一律保留：
+        - 本来就没有进度卡（批量添加、notify.progress=false、初始卡
+          发送失败）：新消息是用户唯一的完成提醒；
+        - 编辑旧卡失败、回退新发：旧卡保持不变（宁可留着也不误删用户
+          可见的内容），新消息同样保留。
+        """
         if entry.message_id:
             try:
                 await self.bot.edit_message_text(
@@ -442,39 +497,71 @@ class DownloadMonitor:
                     reply_markup=keyboard,
                     disable_web_page_preview=True,
                 )
-                delivered = True
+                return True, entry.message_id
             except TelegramError as err:
                 log.debug("进度卡片更新失败，改为发送新消息: %s", err)
-                delivered = (await self._send(entry, text, keyboard)) is not None
-        else:
-            delivered = (await self._send(entry, text, keyboard)) is not None
+        message = await self._send(entry, text, keyboard)
+        if message is None:
+            return False, None
+        return True, None
 
-        if not delivered:
-            log.warning("完成卡片发送失败，任务 %s 保留在队列中下轮重试", torrent.id)
-            # 通知失败也不能跳过暂停：否则任务会一直做种，
-            # 原来的 pause_on_complete 开关就失效了。
-            if self.pause_on_complete and torrent.status == "seeding":
-                try:
-                    await asyncio.to_thread(self.client.stop_torrent, torrent.id)
-                except Exception as err:  # noqa: BLE001
-                    log.warning("完成后暂停失败: %s", err)
+    async def _pause_after_complete(self, torrent: Torrent) -> None:
+        """完成卡没送达时也要暂停；失败只记日志。"""
+        if not (self.pause_on_complete and torrent.status == "seeding"):
             return
+        try:
+            await asyncio.to_thread(self.client.stop_torrent, torrent.id)
+        except Exception as err:  # noqa: BLE001
+            log.warning("完成后暂停失败: %s", err)
 
-        entry.finished = True
-        DownloadHistory.add(
-            torrent.done_date,
-            torrent.name,
-            torrent.download_dir,
-            torrent.size_when_done,
-        )
-        DownloadQueue.remove(torrent.id)
+    async def _pause_and_notify(self, torrent: Torrent, entry: QueueEntry) -> None:
+        """完成后暂停并通知；原逻辑两步在同一个 try 里，任一失败都只记日志。"""
+        try:
+            await asyncio.to_thread(self.client.stop_torrent, torrent.id)
+            await self._send(entry, trans("PAUSED_ON_COMPLETE", entry.lang_code))
+        except Exception as err:  # noqa: BLE001
+            log.warning("完成后暂停失败: %s", err)
 
-        if self.pause_on_complete and torrent.status == "seeding":
-            try:
-                await asyncio.to_thread(self.client.stop_torrent, torrent.id)
-                await self._send(entry, trans("PAUSED_ON_COMPLETE", entry.lang_code))
-            except Exception as err:  # noqa: BLE001
-                log.warning("完成后暂停失败: %s", err)
+    def _record_done(self, torrent: Torrent, entry: QueueEntry) -> None:
+        """追加成功名单；FC2 任务同时排进待删卡片队列。
+
+        这一步的任何失败都不许影响完成流程：名单写不进去就记 error，
+        任务照样算完成（下次不会重来），用户也照样收到完成卡。
+        """
+        name = str(getattr(torrent, "name", "") or entry.title or "")
+        number = extract_number(name)
+        info_hash = str(getattr(torrent, "info_hash", "") or "").lower() or None
+        done_at = getattr(torrent, "done_date", None) or time.time()
+        try:
+            result = self.done_list.append(
+                number=number,
+                title=name,
+                info_hash=info_hash,
+                done_at=done_at,
+                size_when_done=getattr(torrent, "size_when_done", 0) or 0,
+                source=getattr(entry, "source", None) or SOURCE_UNKNOWN,
+            )
+            if result == WRITE_FAILED:
+                log.error("成功名单写入失败: %s", name)
+        except Exception as err:  # noqa: BLE001
+            log.error("成功名单写入异常 %s: %s", name, err)
+        if not number:
+            return
+        # 下载机器人删不了 Fc2专用 发的卡片：把编号放进共享待删队列，
+        # Fc2专用 轮询时自己删。写失败只记日志，不影响完成。
+        try:
+            self.done_deletions.request(number, title=name, done_at=done_at)
+        except Exception as err:  # noqa: BLE001
+            log.warning("写完成待删卡片队列失败 %s: %s", number, err)
+
+    async def _delete_card(self, chat_id, message_id) -> None:
+        """删掉自己发的任务卡片；失败、消息已删都只记日志。"""
+        if not message_id:
+            return
+        try:
+            await self.bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+        except Exception as err:  # noqa: BLE001
+            log.warning("删除完成任务卡片失败 %s/%s: %s", chat_id, message_id, err)
 
     def _done_keyboard(
         self, torrent: Torrent, lang_code: str | None

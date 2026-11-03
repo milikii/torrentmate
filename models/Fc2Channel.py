@@ -25,6 +25,8 @@ from telegram.constants import ParseMode
 from lib.constants import CONFIG_FILE
 from lib.func import escape_html, get_logger
 from models.BotConfigurator import BotConfigurator
+from models.DoneList import DoneDeletionQueue
+from models.DoneList import pending_config_path as done_pending_config_path
 from models.Fc2Blacklist import (
     Fc2Blacklist,
     config_path as blacklist_config_path,
@@ -714,6 +716,27 @@ class Fc2Store:
             self._write()
             return messages
 
+    def message_ids(self, number: str) -> list[int]:
+        """只读：返回这条推送当前已知的卡片 / 附图消息 id。
+
+        完成删卡只能读，绝不能复用 mute()——mute() 会写 muted 和黑名单，
+        已下载完成的片子一旦被拉黑就再也推不了了。这里不落盘、不改任何
+        状态；内存里没有就去磁盘上的 seen 里找（推送器可能是另一个实例）。
+        """
+        key = normalize_number(number) or str(number)
+        with self._lock:
+            record = self.seen.get(key) or {}
+            if not record:
+                disk_seen = self._disk_state().get("seen") or {}
+                record = disk_seen.get(key) or {}
+            messages = []
+            for value in record.get("messages") or []:
+                try:
+                    messages.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return messages
+
 
 class Fc2Pusher:
     """轮询 nyaa FC2 RSS，核验后把新条目推进频道。"""
@@ -724,6 +747,9 @@ class Fc2Pusher:
         self.store = store or Fc2Store()
         # 黑名单独立于状态文件：state 被重置后编号还在，这里必须一起看。
         self.blacklist = blacklist or Fc2Blacklist(blacklist_config_path(self.config))
+        # 下载机器人完成 FC2 任务后把编号写进共享待删文件，本机器人读到
+        # 就删自己发的推送卡（Telegram 只允许机器人删自己的消息）。
+        self.done_deletions = DoneDeletionQueue(done_pending_config_path(self.config))
 
     def _blocked(self, number: str | None) -> bool:
         """黑名单命中才跳过推送；state.muted 只是 fc2no 的兼容记录。
@@ -775,12 +801,39 @@ class Fc2Pusher:
             await asyncio.sleep(interval)
 
     async def _poll_once(self, channel_id) -> None:
+        await self._consume_done_safely(channel_id)
         entries = await asyncio.to_thread(_fetch_entries, self._proxy())
         if not entries:
             return
         last_ts = float(self.store.last_ts or 0)
-        # 增量 = 比游标新的条目 + 之前发失败的条目。失败重试不看游标：
-        # 同秒多条（批量上架）时游标会越过失败那条，只按时间戳过滤就永久漏推。
+        incremental = self._incremental_entries(entries, last_ts)
+        if not incremental:
+            self._prune_retry(entries)
+            return
+        incremental.sort(key=lambda item: float(item["pub_ts"]))
+        newest = max(float(entry["pub_ts"]) for entry in entries)
+        incremental = self._apply_backfill(incremental)
+        cursor = await self._push_incremental(incremental, channel_id, last_ts)
+        # 游标可以放心推到最新：失败条目由 retry 列表兑现，不靠游标兑。
+        self.store.last_ts = max(cursor, newest)
+        self._prune_retry(entries)
+        self.store.save()
+
+    async def _consume_done_safely(self, channel_id) -> None:
+        """先处理完成删卡：哪怕这轮 RSS 拉取失败、没有新条目，下载机器人
+        写下的完成编号也要尽快消费掉。"""
+        try:
+            await self._consume_done_deletions(channel_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            log.warning("处理已完成待删卡片失败: %s", err)
+
+    def _incremental_entries(
+        self, entries: list[dict], last_ts: float
+    ) -> list[dict]:
+        """增量 = 比游标新的条目 + 之前发失败的条目。失败重试不看游标：
+        同秒多条（批量上架）时游标会越过失败那条，只按时间戳过滤就永久漏推。"""
         incremental: list[dict] = []
         position: dict[str, int] = {}
         for entry in entries:
@@ -795,40 +848,40 @@ class Fc2Pusher:
             if number:
                 position[number] = len(incremental)
             incremental.append(entry)
-        if not incremental:
-            self._prune_retry(entries)
-            return
-        incremental.sort(key=lambda item: float(item["pub_ts"]))
-        newest = max(float(entry["pub_ts"]) for entry in entries)
+        return incremental
 
-        if not self.store.backfill_done:
-            limit = max(int(self._setting("backfill_limit", DEFAULT_BACKFILL) or 0), 0)
-            backlog, incremental = (
-                (incremental[:-limit], incremental[-limit:])
-                if limit
-                else (incremental, [])
-            )
-            # 回补占位不能抢了要推的号：同一个 FC2 编号在 RSS 里出现两次时
-            # （旧的在回补里、新的在要推的最后几条里），旧的不能先记 seen，
-            # 否则新的那条在 _push_entry 里会因 seen 已存在被跳过，白白丢一张新卡。
-            pushed_numbers = {
-                extract_number(entry["title"]) for entry in incremental
-            }
-            for entry in backlog:
-                number = extract_number(entry["title"])
-                if (
-                    number
-                    and number not in self.store.seen
-                    and number not in pushed_numbers
-                ):
-                    self.store.remember(number, entry)
-            # 回补只做一次，不能拿 last_ts == 0 当条件：首轮条目全发失败时
-            # 游标会停在 0，下一轮又把老条目划进 backlog 记成 seen，从没发出
-            # 去的卡片就此永久丢失（sol 复现）。
-            self.store.backfill_done = True
-            self.store.save()
+    def _apply_backfill(self, incremental: list[dict]) -> list[dict]:
+        """首次运行时只保留最近 ``backfill_limit`` 条，其余记 seen；返回要推的。"""
+        if self.store.backfill_done:
+            return incremental
+        limit = max(int(self._setting("backfill_limit", DEFAULT_BACKFILL) or 0), 0)
+        if limit:
+            backlog, incremental = incremental[:-limit], incremental[-limit:]
+        else:
+            backlog, incremental = incremental, []
+        # 回补占位不能抢了要推的号：同一个 FC2 编号在 RSS 里出现两次时
+        # （旧的在回补里、新的在要推的最后几条里），旧的不能先记 seen，
+        # 否则新的那条在 _push_entry 里会因 seen 已存在被跳过，白白丢一张新卡。
+        pushed_numbers = {extract_number(entry["title"]) for entry in incremental}
+        for entry in backlog:
+            number = extract_number(entry["title"])
+            if (
+                number
+                and number not in self.store.seen
+                and number not in pushed_numbers
+            ):
+                self.store.remember(number, entry)
+        # 回补只做一次，不能拿 last_ts == 0 当条件：首轮条目全发失败时
+        # 游标会停在 0，下一轮又把老条目划进 backlog 记成 seen，从没发出
+        # 去的卡片就此永久丢失（sol 复现）。
+        self.store.backfill_done = True
+        self.store.save()
+        return incremental
 
-        cursor = last_ts
+    async def _push_incremental(
+        self, incremental: list[dict], channel_id, cursor: float
+    ) -> float:
+        """按时间顺序推送增量条目，返回推进后的游标。"""
         for entry in incremental:
             pub_ts = float(entry["pub_ts"])
             number = extract_number(entry["title"])
@@ -845,11 +898,7 @@ class Fc2Pusher:
                 )
             cursor = max(cursor, pub_ts)
             await asyncio.sleep(PUSH_DELAY)
-
-        # 游标可以放心推到最新：失败条目由 retry 列表兑现，不靠游标兑。
-        self.store.last_ts = max(cursor, newest)
-        self._prune_retry(entries)
-        self.store.save()
+        return cursor
 
     def _prune_retry(self, entries: list[dict]) -> None:
         """已经从 RSS 里消失、或已静音/已推过的失败条目不再挂着无限重试。"""
@@ -863,6 +912,77 @@ class Fc2Pusher:
                 or number in self.store.seen
             ]
         )
+
+    async def _consume_done_deletions(self, chat_id=None) -> int:
+        """删掉下载机器人标记为「已完成」的推送卡，返回消费的记录条数。
+
+        共享待删文件里只有编号：卡片消息 id 从本机器人自己的 Fc2Store
+        读（只读接口 message_ids，绝不走 mute()，不会把已下载的片子拉黑）。
+        黑名单相关的卡不动；删失败只记日志，照样写 ack，避免同一个失败
+        消息每轮都重试刷日志。
+
+        handled 是「消费掉的记录条数」而不是「删掉的消息条数」：每条记录
+        只要 ack 成功（deleted / missing / blacklisted / failed）就计一条。
+        """
+        records = self.done_deletions.pending()
+        if not records:
+            return 0
+        target_chat = chat_id if chat_id is not None else self._target_chat_id()
+        if target_chat is None:
+            log.warning("完成删卡跳过：推送目标未配置")
+            return 0
+        handled = 0
+        for record in records:
+            if await self._consume_one_done_deletion(record, target_chat):
+                handled += 1
+        return handled
+
+    async def _consume_one_done_deletion(self, record: dict, target_chat) -> bool:
+        """处理并 ack 一条待删记录；返回是否由本轮消费掉。"""
+        number = normalize_number(record.get("number"))
+        if not number:
+            return self.done_deletions.ack(record.get("number"), "invalid")
+        if self._blocked(number):
+            # 「不感兴趣」已经删过卡、也拉黑了，完成流程无权再动它。
+            return self.done_deletions.ack(number, "blacklisted")
+        message_ids = self.store.message_ids(number)
+        if not message_ids:
+            # 例如用户手动发的磁力，没有对应的推送卡。
+            return self.done_deletions.ack(number, "missing")
+        failed, removed = await self._delete_done_messages(
+            number, message_ids, target_chat
+        )
+        acked = self.done_deletions.ack(number, "failed" if failed else "deleted")
+        if acked and not failed:
+            log.info("已完成 FC2 卡片已删除 %s（%s 条消息）", number, removed)
+        return acked
+
+    async def _delete_done_messages(
+        self, number: str, message_ids, target_chat
+    ) -> tuple[bool, int]:
+        """逐条删卡；返回（是否有非「消息已不存在」的失败, 删除成功条数）。"""
+        failed = False
+        removed = 0
+        for message_id in message_ids:
+            try:
+                await self.bot.delete_message(
+                    chat_id=target_chat, message_id=message_id
+                )
+                removed += 1
+            except Exception as err:  # noqa: BLE001
+                text = str(err).lower()
+                if "not found" in text:
+                    # 已经删掉了（用户手删 / 上一轮删到一半），不算失败。
+                    log.debug("FC2 完成卡已不存在 %s/%s", number, message_id)
+                else:
+                    failed = True
+                    log.warning(
+                        "删除已完成 FC2 卡片失败 %s/%s: %s",
+                        number,
+                        message_id,
+                        err,
+                    )
+        return failed, removed
 
     async def _push_entry(self, entry: dict, channel_id) -> bool:
         """推一条卡片，返回这条是否已经处理完（False 表示失败、下轮要重试）。"""

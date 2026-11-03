@@ -142,3 +142,10 @@ fc2:
   # 要让两边查到同一份黑名单，就挂一个共享目录到两个容器，并把这里指到
   # 同一个路径，例如 /usr/src/app/shared/fc2_blacklist.json。
   # blacklist_file: /usr/src/app/shared/fc2_blacklist.json
+  # 下载成功名单（一行一条 JSON，只追加）：任务完成后写入，任务删了也保留；
+  # 两个容器必须指到同一个共享文件，/fc2done 在两边查到的结果才一致。
+  # 不填默认本 config 目录下的 fc2_done.jsonl（两个容器就不共享了）。
+  # done_file: /usr/src/app/shared/fc2_done.jsonl
+  # 完成卡待删队列：下载机器人写编号，Fc2专用 读到后删自己发的推送卡。
+  # 不填默认 <done_file>.pending，跟着成功名单一起落在共享目录。
+  # done_pending_file: /usr/src/app/shared/fc2_done.jsonl.pending

@@ -25,6 +25,7 @@ from lib.constants import (
     AUTO_DIR_CALLBACK,
     MAX_BATCH_LINKS,
 )
+from lib.done_commands import fc2done_command
 from lib.func import (
     bytes_to_human,
     escape_html,
@@ -41,9 +42,16 @@ from models.BotConfigurator import BotConfigurator
 from models.Browser import Browser
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue
+from models.DoneList import (
+    SOURCE_BATCH,
+    SOURCE_FC2_CARD,
+    SOURCE_MANUAL,
+    DoneList,
+    config_path as done_config_path,
+)
 from models.Fc2Blacklist import (
     SOURCE_DELETE,
-    SOURCE_MANUAL,
+    SOURCE_MANUAL as BLACKLIST_SOURCE_MANUAL,
     SOURCE_MUTE,
     Fc2Blacklist,
     config_path as blacklist_config_path,
@@ -420,6 +428,8 @@ async def _add_batch(  # noqa: C901
             message_id = None
 
     added, duplicates, failed, blocked = [], [], [], []
+    # 曾经下载过的提示（只提示、不拦截；命中也照常添加）
+    previously: list[str] = []
     for index, item in enumerate(links, 1):
         if isinstance(item, MagnetLink):
             link = item
@@ -478,6 +488,7 @@ async def _add_batch(  # noqa: C901
                 download_dir=target,
                 title=link.name,
                 auto_classify=auto,
+                source=SOURCE_BATCH,
             )
             if info_hash:
                 existing[info_hash] = torrent
@@ -487,6 +498,17 @@ async def _add_batch(  # noqa: C901
             if path is not None:
                 seen_paths[path] = torrent
             added.append((link, torrent, target, auto))
+            hint_number = extract_number(link.name or "")
+            hint = _done_hint(
+                number=hint_number,
+                info_hash=(
+                    None
+                    if hint_number
+                    else (actual_hash or info_hash or None)
+                ),
+            )
+            if hint:
+                previously.append(hint)
         except Exception as err:  # noqa: BLE001
             log.error("添加批量任务失败 %s: %s", info_hash or link.raw, err)
             failed.append((link, err))
@@ -545,6 +567,13 @@ async def _add_batch(  # noqa: C901
                 "、".join(f"FC2-PPV-{number}" for number in blocked[:5]),
             )
         )
+    if previously:
+        # 只提示：这些任务的添加流程已经走完，提示不改变任何结果。
+        lines.append(f"📌 曾经下载过 {len(previously)} 条（任务仍已添加）：")
+        for hint in previously[:5]:
+            lines.append(f"  • {escape_html(hint)}")
+        if len(previously) > 5:
+            lines.append(f"  …还有 {len(previously) - 5} 条")
     if failed:
         lines.append(trans("BATCH_FAILED", lang_code).format(len(failed)))
         for link, reason in failed[:5]:
@@ -692,6 +721,7 @@ async def _add_single(  # noqa: C901
             title=data.get("title"),
             auto_classify=auto,
             single_dedup=True,
+            source=SOURCE_MANUAL,
         )
     except TorrentAlreadyExists:
         await context.bot.send_message(
@@ -728,6 +758,18 @@ async def _add_single(  # noqa: C901
             DownloadQueue.update(entry)
     except TelegramError as err:
         log.debug("发送初始进度卡片失败: %s", err)
+
+    # 之前下载过就提示一句：只提示，任务已经加进去了，绝不回滚。
+    hint_number = extract_number(data.get("title") or data.get("file_name") or "")
+    hint = _done_hint(
+        number=hint_number,
+        info_hash=None if hint_number else getattr(torrent, "info_hash", None),
+    )
+    if hint:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=hint)
+        except TelegramError as err:
+            log.debug("成功名单提示发送失败: %s", err)
 
     if auto:
         await context.bot.send_message(
@@ -1068,6 +1110,31 @@ def _fc2_blacklist() -> Fc2Blacklist:
     return Fc2Blacklist(blacklist_config_path(bot_config))
 
 
+def _done_list() -> DoneList:
+    """成功名单实例：路径取 fc2.done_file，两个容器指同一文件才共享。"""
+    return DoneList(done_config_path(bot_config))
+
+
+def _done_hint(number=None, info_hash=None) -> str | None:
+    """查成功名单，命中就返回一条提示（只提示、绝不拦截添加）。
+
+    FC2 任务按归一化编号比；非 FC2 只按 info_hash，没有 hash 就不查
+    （不做标题模糊匹配，免得把名字相近的片子误报成下过）。查询失败
+    只记 debug，绝不影响添加流程。
+    """
+    try:
+        records = _done_list().find(number=number, info_hash=info_hash)
+    except Exception as err:  # noqa: BLE001
+        log.debug("查询成功名单失败 %s/%s: %s", number, info_hash, err)
+        return None
+    if not records:
+        return None
+    latest = max(records, key=lambda item: item.get("done_at") or "")
+    title = _truncate(latest.get("title") or "无标题", 48)
+    done_at = latest.get("done_at") or "时间未知"
+    return f"📌 之前下载过：{title}（{done_at}）"
+
+
 def _fc2_number(raw) -> str | None:
     """把用户输入归一成编号：FC2-PPV-5000545 / fc2ppv 5000545 / 5000545 都认。"""
     text = str(raw or "").strip()
@@ -1205,6 +1272,7 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             auto_classify=True,
             single_dedup=True,
             notify=False,
+            source=SOURCE_FC2_CARD,
         )
     except TorrentAlreadyExists:
         # 任务已经在下载器里：旧卡片晚点再点、或上次改按钮失败后重进，
@@ -1218,7 +1286,12 @@ async def fc2_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("添加失败")
         return
     await _mark_fc2_downloaded(context.bot, query, number)
-    await query.answer("已开始下载")
+    # 成功名单里查得到就顺带提示，toast 最长 200 字，截短；绝不拦截。
+    hint = _done_hint(number=number)
+    if hint:
+        await query.answer(("已开始下载｜" + hint)[:190])
+    else:
+        await query.answer("已开始下载")
 
 
 async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1615,7 +1688,7 @@ async def fc2block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         title = _fc2_title_for(number)
         blacklist = _fc2_blacklist()
-        recorded = bool(blacklist.add(number, title, SOURCE_MANUAL))
+        recorded = bool(blacklist.add(number, title, BLACKLIST_SOURCE_MANUAL))
     except Exception as err:  # noqa: BLE001
         log.warning("记 FC2 黑名单失败 %s: %s", number, err)
         blacklist = None
@@ -1930,6 +2003,8 @@ HANDLERS = [
     CommandHandler("fc2del", fc2del_command),
     CommandHandler("fc2block", fc2block_command),
     CommandHandler("fc2unblock", fc2unblock_command),
+    # 下载成功名单（两个机器人共用同一份共享文件，实现见 lib/done_commands.py）
+    CommandHandler("fc2done", fc2done_command),
     # 底部键盘按钮（多语言文案）
     MessageHandler(Regex(button_regex("menu.torrents")), torrentList),
     MessageHandler(Regex(button_regex("menu.search")), lastSearchResults),

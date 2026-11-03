@@ -2428,3 +2428,80 @@ async def test_pending_overflow_six_batches_all_redelivered_after_recovery(
     delivered = "\n\n".join(sent["text"] for sent in env.bot.sent)
     for count in (9, 10, 11, 12, 13, 14):
         assert delivered.count(f"已添加 {count} / {count}") == 1
+
+
+# ---------------------------------------------------------------- 成功名单提示
+
+
+def done_file_path(tmp_path):
+    # 默认名单跟着 BotConfigurator.config_file 走，env 里就是 tmp。
+    return str(tmp_path / "fc2_done.jsonl")
+
+
+async def test_batch_add_hints_previous_downloads_without_blocking(
+    env, tmp_path, monkeypatch
+):
+    from models.DoneList import DoneList
+
+    done = DoneList(done_file_path(tmp_path))
+    done.append(number="1234567", title="FC2 旧片原标题", done_at="2026-11-01 09:00:00")
+    done.append(
+        title="SSIS 旧片原标题",
+        info_hash="89abcdef0123456789abcdef0123456789abcdef",
+        done_at="2026-11-02 09:00:00",
+    )
+    context = SimpleNamespace(user_data={"batch": extract_magnets(TEXT)}, bot=env.bot)
+
+    await handlers.confirmDirChoice(make_update("__auto__"), context)
+
+    # 命中只提示，绝不拦截：三条照常全部添加
+    assert len(env.client.added) == 3
+    assert all(call["source"] == "batch" for call in env.client.added)
+    summary = env.bot.edits[-1]["text"]
+    assert "已添加 3 / 3" in summary
+    assert "曾经下载过 2 条" in summary
+    assert "FC2 旧片原标题" in summary
+    assert "SSIS 旧片原标题" in summary
+
+
+async def test_single_add_replies_hint_without_blocking(env, tmp_path, monkeypatch):
+    from models.DoneList import DoneList
+
+    DoneList(done_file_path(tmp_path)).append(
+        number="5000545", title="FC2-PPV-5000545 原名", done_at="2026-11-01 09:00:00"
+    )
+    context = torrent_url_context(
+        env.bot,
+        f"magnet:?xt=urn:btih:{FC2_HASH}&dn=FC2-PPV-5000545+new",
+        title="FC2-PPV-5000545 new",
+    )
+
+    await handlers.confirmDirChoice(make_update("__auto__"), context)
+
+    assert len(env.client.added) == 1
+    assert env.client.added[0]["source"] == "manual"
+    texts = [message["text"] for message in env.bot.sent]
+    assert any("之前下载过" in text and "原名" in text for text in texts)
+
+
+async def test_fc2_download_toast_hints_previous_download(env, tmp_path, monkeypatch):
+    from models.DoneList import DoneList
+
+    store = install_fc2_store(monkeypatch, tmp_path)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[555],
+    )
+    DoneList(done_file_path(tmp_path)).append(
+        number="5000545", title="FC2-PPV-5000545 原名", done_at="2026-11-01 09:00:00"
+    )
+    update, answers = make_fc2_callback("fc2dl:5000545")
+
+    await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert len(env.client.added) == 1
+    assert env.client.added[0]["source"] == "fc2-card"
+    assert answers
+    assert answers[-1].startswith("已开始下载｜")
+    assert "原名" in answers[-1]

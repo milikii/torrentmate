@@ -76,6 +76,7 @@ class FakeBot:
         self.groups = []
         self.markups = []
         self.messages = []
+        self.deleted = []
         self.fail_groups = False
         self.fail_photos = 0
         self._next_id = 100
@@ -83,6 +84,10 @@ class FakeBot:
     def _message(self):
         self._next_id += 1
         return SimpleNamespace(message_id=self._next_id)
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
 
     async def send_photo(self, **kwargs):
         if self.fail_photos > 0:
@@ -1166,3 +1171,104 @@ async def test_poll_skips_blacklisted_entry(tmp_path, monkeypatch):
 
     assert bot.photos == [] and bot.groups == []
     assert store.seen == {}
+
+
+# ---------------------------------------------------------------- 已完成删卡
+
+
+def test_message_ids_is_read_only(tmp_path):
+    # 完成删卡只能读消息 id；绝不能像 mute() 那样写 muted / 黑名单。
+    store = fc2.Fc2Store(str(tmp_path / "fc2_state.json"))
+    store.remember(
+        "5000545",
+        {"hash": "a" * 40, "title": "FC2-PPV-5000545 x", "pub_ts": 1},
+        messages=[111, 112],
+    )
+
+    ids = store.message_ids("05000545")
+
+    assert ids == [111, 112]
+    assert store.muted == set()
+    # 再读一次也不会落盘、不会改 seen
+    assert store.message_ids("5000545") == [111, 112]
+
+
+async def test_done_deletion_consumer_deletes_own_card_and_acks(
+    tmp_path, monkeypatch
+):
+    pending_path = tmp_path / "done_pending.jsonl"
+    pusher, store, bot = make_pusher(
+        tmp_path, monkeypatch, done_pending_file=str(pending_path)
+    )
+    store.remember(
+        "5000545",
+        {"hash": "a" * 40, "title": "FC2-PPV-5000545 x", "pub_ts": 1},
+        messages=[111, 112],
+    )
+    queue = fc2.DoneDeletionQueue(str(pending_path))
+    assert queue.request("05000545", title="FC2-PPV-5000545 x") is True
+
+    handled = await pusher._consume_done_deletions()
+
+    assert handled == 1
+    assert bot.deleted == [(-1001234, 111), (-1001234, 112)]
+    assert queue.pending() == []
+    # 只删卡，不写 muted / 黑名单
+    assert store.muted == set()
+    assert pusher.blacklist.contains("5000545") is False
+
+
+async def test_done_deletion_consumer_skips_blacklisted_card(tmp_path, monkeypatch):
+    pending_path = tmp_path / "done_pending.jsonl"
+    pusher, store, bot = make_pusher(
+        tmp_path, monkeypatch, done_pending_file=str(pending_path)
+    )
+    pusher.blacklist.add("5000545", "FC2-PPV-5000545 x", "fc2no")
+    store.remember(
+        "5000545",
+        {"hash": "a" * 40, "title": "FC2-PPV-5000545 x", "pub_ts": 1},
+        messages=[111],
+    )
+    queue = fc2.DoneDeletionQueue(str(pending_path))
+    queue.request("5000545")
+
+    await pusher._consume_done_deletions()
+
+    assert bot.deleted == []
+    assert queue.pending() == []
+
+
+async def test_done_deletion_consumer_acks_missing_card(tmp_path, monkeypatch):
+    pending_path = tmp_path / "done_pending.jsonl"
+    pusher, _store, bot = make_pusher(
+        tmp_path, monkeypatch, done_pending_file=str(pending_path)
+    )
+    queue = fc2.DoneDeletionQueue(str(pending_path))
+    queue.request("5000999")
+
+    handled = await pusher._consume_done_deletions()
+
+    assert handled == 1
+    assert bot.deleted == []
+    assert queue.pending() == []
+
+
+async def test_poll_consumes_done_deletions_even_without_new_feed(
+    tmp_path, monkeypatch
+):
+    pending_path = tmp_path / "done_pending.jsonl"
+    pusher, store, bot = make_pusher(
+        tmp_path, monkeypatch, done_pending_file=str(pending_path)
+    )
+    store.remember(
+        "5000545",
+        {"hash": "a" * 40, "title": "FC2-PPV-5000545 x", "pub_ts": 1},
+        messages=[111],
+    )
+    fc2.DoneDeletionQueue(str(pending_path)).request("5000545")
+    # RSS 拉取失败 / 空列表也必须先删完成卡
+    monkeypatch.setattr(fc2, "_fetch_entries", lambda *a, **k: [])
+
+    await pusher._poll_once(-1001234)
+
+    assert bot.deleted == [(-1001234, 111)]

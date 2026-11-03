@@ -27,6 +27,9 @@ class QueueEntry:
     # 持久化时保存 info_hash，重启后按旧数字 ID 查到的任务若 hash 不符
     # 说明 ID 已被别的任务复用，必须停止对它做移动/完成等自动操作。
     info_hash: str | None = None
+    # 任务来源：fc2-card / manual / batch / unknown（历史条目没有这个字段，
+    # from_json 只认已知字段 + dataclass 默认值，旧队列文件照常能读）。
+    source: str = "unknown"
     auto_classify: bool = False
     message_id: int | None = None
     # 批量添加时，任务过多就不为每个任务单独发进度卡片

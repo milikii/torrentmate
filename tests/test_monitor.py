@@ -1015,3 +1015,250 @@ async def test_readded_torrent_with_same_info_hash_is_adopted(env):
     assert entry is not None
     assert entry.info_hash == "d00c0ffee"
     assert DownloadQueue.get(7) is None
+
+
+# ---------------------------------------------------------------- 成功名单 / 完成删卡
+
+
+class DeletingBot(FakeBot):
+    """完成删卡要真的调用 delete_message，这里补上记录。"""
+
+    def __init__(self):
+        super().__init__()
+        self.deleted = []
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
+
+
+async def test_completion_writes_done_list_pending_and_deletes_card(env, tmp_path):
+    from models.DoneList import DoneDeletionQueue, DoneList
+
+    torrent = FakeTorrent(
+        name="FC2-PPV-5000545 sample",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/FC2",
+        done_date=dt.datetime(2026, 11, 3, 12, 0, 0),
+        size_when_done=1234,
+    )
+    bot = DeletingBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/FC2",
+            message_id=555,
+            source="fc2-card",
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    records = DoneList(str(tmp_path / "fc2_done.jsonl")).all()
+    assert len(records) == 1
+    record = records[0]
+    assert record["number"] == "5000545"
+    assert record["title"] == "FC2-PPV-5000545 sample"
+    assert record["source"] == "fc2-card"
+    assert record["done_at"] == "2026-11-03 12:00:00"
+    assert record["size_when_done"] == 1234
+
+    # 完成卡是监控机器人自己发的，直接删
+    assert (9, 555) in bot.deleted
+    # 原推送卡归 Fc2专用，写进共享待删队列
+    pending = DoneDeletionQueue(
+        str(tmp_path / "fc2_done.jsonl.pending")
+    ).pending()
+    assert [item["number"] for item in pending] == ["5000545"]
+
+
+async def test_completion_not_delivered_writes_nothing(env, tmp_path):
+    from telegram.error import TelegramError
+
+    from models.DoneList import DoneDeletionQueue, DoneList
+
+    class FailingBot(DeletingBot):
+        async def edit_message_text(self, **kwargs):
+            raise TelegramError("boom")
+
+        async def send_message(self, **kwargs):
+            raise TelegramError("boom")
+
+    torrent = FakeTorrent(
+        name="FC2-PPV-5000545 sample",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/FC2",
+        done_date=dt.datetime(2026, 11, 3, 12, 0, 0),
+        size_when_done=1234,
+    )
+    bot = FailingBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/FC2",
+            message_id=555,
+            source="fc2-card",
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    assert DoneList(str(tmp_path / "fc2_done.jsonl")).all() == []
+    assert DoneDeletionQueue(
+        str(tmp_path / "fc2_done.jsonl.pending")
+    ).pending() == []
+    assert bot.deleted == []
+    # 完成卡没送达，任务保留在队列里等下一轮重试
+    assert DownloadQueue.get(1) is not None
+
+
+async def test_non_fc2_completion_writes_list_without_pending(env, tmp_path):
+    from models.DoneList import DoneDeletionQueue, DoneList
+
+    torrent = FakeTorrent(
+        name="SSIS-123",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/有码",
+        done_date=dt.datetime(2026, 11, 3, 13, 0, 0),
+        size_when_done=99,
+        info_hash="abcdef0123456789abcdef0123456789abcdef01",
+    )
+    bot = DeletingBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=556,
+            source="manual",
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    records = DoneList(str(tmp_path / "fc2_done.jsonl")).all()
+    assert len(records) == 1
+    assert records[0]["number"] is None
+    assert records[0]["info_hash"] == "abcdef0123456789abcdef0123456789abcdef01"
+    assert records[0]["source"] == "manual"
+    # 非 FC2 没有推送卡可删，不应排进待删队列
+    assert DoneDeletionQueue(
+        str(tmp_path / "fc2_done.jsonl.pending")
+    ).pending() == []
+
+
+async def test_completion_without_progress_card_keeps_new_message(env, tmp_path):
+    """没有进度卡的任务：新发的完成消息是唯一提醒，不能被删。"""
+    from models.DoneList import DoneList
+
+    torrent = FakeTorrent(
+        name="SSIS-456",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/有码",
+        done_date=dt.datetime(2026, 11, 3, 14, 0, 0),
+        size_when_done=10,
+    )
+    bot = DeletingBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=None,
+            source="manual",
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    assert not bot.edits, "没有进度卡时不应尝试编辑"
+    done_messages = [m for m in bot.sent if "下载完成" in m["text"]]
+    assert len(done_messages) == 1
+    assert bot.deleted == [], "新发的完成消息必须保留，不能发出即删"
+    assert DownloadQueue.get(1) is None
+    assert len(DoneList(str(tmp_path / "fc2_done.jsonl")).all()) == 1
+
+
+async def test_completion_with_progress_card_deletes_edited_card(env):
+    """有进度卡且编辑成功：把这张旧卡删掉，原有行为不变。"""
+    torrent = FakeTorrent(
+        name="SSIS-789",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/有码",
+        done_date=dt.datetime(2026, 11, 3, 15, 0, 0),
+        size_when_done=10,
+    )
+    bot = DeletingBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=777,
+            source="manual",
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    assert bot.edits and "下载完成" in bot.edits[0]["text"]
+    assert bot.edits[0]["message_id"] == 777
+    assert bot.deleted == [(9, 777)]
+    assert not [m for m in bot.sent if "下载完成" in m["text"]]
+
+
+async def test_completion_edit_failure_keeps_fallback_message(env, tmp_path):
+    """编辑旧卡失败回退新发：新消息保留，旧卡也不删。"""
+    from telegram.error import TelegramError
+
+    from models.DoneList import DoneList
+
+    class EditFailingBot(DeletingBot):
+        async def edit_message_text(self, **kwargs):
+            raise TelegramError("message can't be edited")
+
+    torrent = FakeTorrent(
+        name="SSIS-321",
+        percent_done=1.0,
+        left_until_done=0,
+        status="seeding",
+        download_dir="/downloads/有码",
+        done_date=dt.datetime(2026, 11, 3, 16, 0, 0),
+        size_when_done=10,
+    )
+    bot = EditFailingBot()
+    DownloadQueue.add(
+        QueueEntry(
+            torrent_id=1,
+            chat_id=9,
+            lang_code="zh",
+            requested_dir="/downloads/有码",
+            message_id=888,
+            source="manual",
+        )
+    )
+
+    await DownloadMonitor(FakeClient(torrent), bot).tick()
+
+    done_messages = [m for m in bot.sent if "下载完成" in m["text"]]
+    assert len(done_messages) == 1
+    assert bot.deleted == [], "回退新发的完成消息和旧进度卡都不应被删"
+    assert DownloadQueue.get(1) is None
+    assert len(DoneList(str(tmp_path / "fc2_done.jsonl")).all()) == 1

@@ -65,12 +65,15 @@ class TransmissionClient(Client):
         message_id: int | None = None,
         single_dedup: bool = False,
         notify: bool = True,
+        source: str = "unknown",
         **kwargs: Any,
     ) -> Torrent:
         """添加任务并把通知信息写入下载队列。
 
         notify=False 时只往 tr-bt 加任务、不写通知队列（由别的机器人
         负责发现并推送）；single_dedup 的前后两次查重语义保持不变。
+        source 记进 QueueEntry（fc2-card / manual / batch / unknown），
+        完成时随成功名单一起落盘；不参与 RPC 参数。
         """
         if download_dir:
             kwargs["download_dir"] = download_dir
@@ -113,6 +116,7 @@ class TransmissionClient(Client):
             info_hash=actual_hash or None,
             auto_classify=auto_classify,
             message_id=message_id,
+            source=str(source or "unknown"),
             final_dir=str(download_dir) if download_dir else None,
         )
         if single_dedup:
