@@ -1500,9 +1500,9 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cover_id = getattr(message, "message_id", None)
     targets = []
     if message is not None:
-        # 封面只认本次回调。旧 seen 没有 chat 时，消息 ID 不能跨聊天猜配。
+        # 旧 seen 的附图沿用回调封面的聊天；已记录的异聊天仍不能删附图。
         targets.append(cover_id)
-        if record.get("chat_id") is not None and str(record["chat_id"]) == str(target_chat):
+        if record.get("chat_id") is None or str(record["chat_id"]) == str(target_chat):
             targets.extend(mid for mid in stored_ids if mid not in targets)
     removed = 0
     cover_removed = False
@@ -1525,6 +1525,7 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message is not None and not cover_removed:
         cleared, marked = await _mark_fc2_muted(context.bot, message, number, recorded)
     deleted = bool(targets) and removed == len(targets)
+    remaining = len(targets) - removed
     log.info(
         "FC2 fc2no 回调结果 number=%s user=授权一致 chat=已脱敏 msg=%s hostname=%s blacklist=%s blacklist_written=%s delete=%s/%s keyboard_removed=%s marked=%s",
         number,
@@ -1540,11 +1541,15 @@ async def fc2_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if recorded and deleted:
         await query.answer("已拉黑并删除，以后不再推送")
     elif recorded:
-        await query.answer("已拉黑，但未能删除全部卡片（可能超时或权限不足）")
+        await query.answer(
+            f"已拉黑，但未能删除全部卡片（已删除 {removed} 张，剩余 {remaining} 张；可能超时或权限不足）"
+        )
     elif deleted:
         await query.answer("卡片已删除，但黑名单写入失败，重启后可能还会推送")
     else:
-        await query.answer("黑名单写入失败，卡片也未全部删除")
+        await query.answer(
+            f"黑名单写入失败，卡片也未全部删除（已删除 {removed} 张，剩余 {remaining} 张）"
+        )
 
 
 @restricted

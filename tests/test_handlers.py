@@ -307,7 +307,9 @@ async def test_batch_add_skips_duplicates(env):
 
 
 @pytest.mark.parametrize("magnet_first", [False, True])
-async def test_batch_add_deduplicates_torrent_paths_and_hashes(env, tmp_path, magnet_first):
+async def test_batch_add_deduplicates_torrent_paths_and_hashes(
+    env, tmp_path, magnet_first
+):
     first = tmp_path / "sample.torrent"
     copy = tmp_path / "copy.torrent"
     distinct = tmp_path / "other" / "sample.torrent"
@@ -472,11 +474,11 @@ async def test_single_duplicate_keeps_original_entry_and_sends_only_notice(
     DownloadQueue.add(original)
     before_json = original.to_json()
     before_state = state.read_text(encoding="utf-8")
-    calls = install_client(
-        monkeypatch, [existing_torrent(55, info_hash.upper())]
-    )
+    calls = install_client(monkeypatch, [existing_torrent(55, info_hash.upper())])
 
-    await handlers.confirmDirChoice(make_update("__auto__"), torrent_upload_context(env.bot))
+    await handlers.confirmDirChoice(
+        make_update("__auto__"), torrent_upload_context(env.bot)
+    )
 
     assert calls == []
     assert DownloadQueue.get(55) is original
@@ -499,9 +501,7 @@ async def test_single_skips_same_hash_from_upload_search_and_magnet(
     source = tmp_path / "source.torrent"
     info_hash = write_torrent(source)
     env.bot.payload = source.read_bytes()
-    DownloadQueue.add(
-        QueueEntry(torrent_id=1, chat_id=8, info_hash=info_hash.upper())
-    )
+    DownloadQueue.add(QueueEntry(torrent_id=1, chat_id=8, info_hash=info_hash.upper()))
     calls = install_client(monkeypatch, [])
 
     copy = tmp_path / "renamed.torrent"
@@ -609,9 +609,7 @@ async def test_single_transmission_existing_without_queue_entry_is_skipped(
     ]
 
 
-async def test_single_rpc_result_matching_queue_entry_is_preserved(
-    env, monkeypatch
-):
+async def test_single_rpc_result_matching_queue_entry_is_preserved(env, monkeypatch):
     info_hash = "0123456789abcdef0123456789abcdef01234567"
     original = QueueEntry(
         torrent_id=9,
@@ -679,7 +677,9 @@ async def test_single_new_add_cleans_temp_and_announces_auto_classify(
     added.info_hash = info_hash
     calls = install_client(monkeypatch, [], add_result=added)
 
-    await handlers.confirmDirChoice(make_update("__auto__"), torrent_upload_context(env.bot))
+    await handlers.confirmDirChoice(
+        make_update("__auto__"), torrent_upload_context(env.bot)
+    )
 
     assert len(calls) == 1
     assert DownloadQueue.get(4) is not None
@@ -695,9 +695,7 @@ async def test_single_add_error_cleans_temp_without_queue_entry(
     source = tmp_path / "source.torrent"
     write_torrent(source)
     env.bot.payload = source.read_bytes()
-    install_client(
-        monkeypatch, [], add_error=RuntimeError("transmission is down")
-    )
+    install_client(monkeypatch, [], add_error=RuntimeError("transmission is down"))
 
     await handlers.confirmDirChoice(
         make_update("/downloads/未分类"), torrent_upload_context(env.bot)
@@ -1008,28 +1006,36 @@ async def test_fc2_download_missing_callback_message_keeps_success(
     assert env.bot.sent == []
 
 
-async def test_fc2_mute_deletes_all_cards_and_persists(env, tmp_path, monkeypatch):
+@pytest.mark.parametrize("record_chat", [9, "9"])
+async def test_fc2_mute_deletes_all_cards_and_persists(
+    env, tmp_path, monkeypatch, caplog, record_chat
+):
     store = install_fc2_store(monkeypatch, tmp_path)
     store.remember(
         "5000545",
-        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1, "chat_id": 9},
-        messages=[123, 124, 125],
+        {
+            "hash": FC2_HASH,
+            "title": "FC2-PPV-5000545 sample",
+            "pub_ts": 1,
+            "chat_id": record_chat,
+        },
+        messages=[123, 124, 125, 77, 123],
     )
     update, answers = make_fc2_callback("fc2no:5000545")
 
-    await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
+    with caplog.at_level(logging.INFO):
+        await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
 
     assert env.bot.deleted == [(9, 77), (9, 123), (9, 124), (9, 125)]
     assert "5000545" in store.muted
     fresh = type(store)(str(store.path))
     assert "5000545" in fresh.muted
     assert answers == ["已拉黑并删除，以后不再推送"]
+    assert "blacklist_written=True delete=4/4" in caplog.text
 
 
 @pytest.mark.parametrize("data", ["fc2dl:5000545", "fc2no:5000545"])
-async def test_fc2_callbacks_ignore_other_users(
-    env, tmp_path, monkeypatch, data
-):
+async def test_fc2_callbacks_ignore_other_users(env, tmp_path, monkeypatch, data):
     store = install_fc2_store(monkeypatch, tmp_path)
     store.remember(
         "5000545",
@@ -1071,9 +1077,13 @@ def install_fc2_media(monkeypatch):
     monkeypatch.setattr(
         fc2,
         "_preview_images",
-        lambda *a, **k: fc2.OfficialArticle(images=(["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"])),
+        lambda *a, **k: fc2.OfficialArticle(
+            images=(["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"])
+        ),
     )
-    monkeypatch.setattr(fc2, "_download_images", lambda *a, **k: ([b"1", b"2", b"3"], []))
+    monkeypatch.setattr(
+        fc2, "_download_images", lambda *a, **k: ([b"1", b"2", b"3"], [])
+    )
     monkeypatch.setattr(fc2, "_nyaa_detail_images", lambda *a, **k: [])
     monkeypatch.setattr(fc2, "_translate_ja_to_zh", lambda *a, **k: "")
 
@@ -1142,7 +1152,9 @@ async def test_fc2_mute_via_real_callback_store_during_window(
     assert callback_store.path == pusher_store.path
     assert callback_store.entry("5000545")["messages"] == [2001]
 
-    update, answers = make_fc2_callback("fc2no:5000545", chat_id=-1001234, message_id=2001)
+    update, answers = make_fc2_callback(
+        "fc2no:5000545", chat_id=-1001234, message_id=2001
+    )
     await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
 
     assert answers == ["已拉黑并删除，以后不再推送"]
@@ -1313,9 +1325,7 @@ async def test_batch_blacklist_check_failure_preserves_items_for_retry(
     assert "添加中" not in text
 
 
-async def test_fc2_mute_reports_blacklist_write_failure(
-    env, tmp_path, monkeypatch
-):
+async def test_fc2_mute_reports_blacklist_write_failure(env, tmp_path, monkeypatch):
     # 共享黑名单写不进去（比如目录只剩 .lock 可写）：只落了 state.muted，
     # 回调必须如实说记录失败，不能谎报「以后不再推送」。
     store = install_fc2_store(monkeypatch, tmp_path)
@@ -1333,7 +1343,7 @@ async def test_fc2_mute_reports_blacklist_write_failure(
     await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
 
     assert answers == ["卡片已删除，但黑名单写入失败，重启后可能还会推送"]
-    assert env.bot.deleted == [(9, 77)]
+    assert env.bot.deleted == [(9, 77), (9, 123)]
     assert "5000545" in store.muted
     assert blacklist.contains("5000545") is False
 
@@ -1361,9 +1371,7 @@ async def test_manual_torrent_delete_records_blacklist(env, tmp_path, monkeypatc
     env.client.torrents = [FakeTorrent(31, "FC2-PPV-5000545 sample", "/downloads/FC2")]
     update = make_delete_update("/delete_31")
 
-    await handlers.torrentDelete(
-        update, SimpleNamespace(user_data={}, bot=env.bot)
-    )
+    await handlers.torrentDelete(update, SimpleNamespace(user_data={}, bot=env.bot))
 
     assert env.client.removed == [(31, None)]
     record = blacklist.get("5000545")
@@ -1408,15 +1416,15 @@ async def test_fc2check_reports_but_never_deletes(env, tmp_path, monkeypatch):
     assert env.client.removed == []
 
 
-async def test_fc2check_reports_disk_leftovers_when_mounted(
-    env, tmp_path, monkeypatch
-):
+async def test_fc2check_reports_disk_leftovers_when_mounted(env, tmp_path, monkeypatch):
     install_fc2_blacklist(monkeypatch, tmp_path)
     leftover = tmp_path / "downloads" / "FC2" / "FC2-PPV-5000545 leftover"
     leftover.mkdir(parents=True)
     covered = tmp_path / "downloads" / "FC2" / "FC2-PPV-5000546 has-task"
     covered.mkdir()
-    env.client.torrents = [FakeTorrent(15, "FC2-PPV-5000546 has-task", "/downloads/FC2")]
+    env.client.torrents = [
+        FakeTorrent(15, "FC2-PPV-5000546 has-task", "/downloads/FC2")
+    ]
     original_get = handlers.bot_config.get
     monkeypatch.setattr(
         handlers.bot_config,
@@ -1936,7 +1944,9 @@ async def test_fc2unblock_read_race_does_not_report_absent(env, tmp_path, monkey
     assert "5000545" in path.read_text(encoding="utf-8")
 
 
-async def test_fc2block_read_race_does_not_report_not_blocked(env, tmp_path, monkeypatch):
+async def test_fc2block_read_race_does_not_report_not_blocked(
+    env, tmp_path, monkeypatch
+):
     # BLOCK 2：add() 写盘失败后、查 contains() 前刷新读失败，
     # 不能报「没有进黑名单 / 拦截不会生效」——磁盘条目仍然在。
     store = install_fc2_store(monkeypatch, tmp_path)
@@ -2093,17 +2103,13 @@ def make_dir_prompt_update(text, message_id, chat_id=9):
 async def test_old_single_preview_button_cannot_consume_new_single(env):
     context = SimpleNamespace(user_data={}, bot=env.bot)
     await handlers.chooseDownloadDir(
-        make_dir_prompt_update(
-            "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=SSIS-111", 77
-        ),
+        make_dir_prompt_update("magnet:?xt=urn:btih:" + "a" * 40 + "&dn=SSIS-111", 77),
         context,
     )
     assert context.user_data["torrent_prompt"] == 77
 
     await handlers.chooseDownloadDir(
-        make_dir_prompt_update(
-            "magnet:?xt=urn:btih:" + "b" * 40 + "&dn=SSIS-999", 99
-        ),
+        make_dir_prompt_update("magnet:?xt=urn:btih:" + "b" * 40 + "&dn=SSIS-999", 99),
         context,
     )
     assert context.user_data["torrent_prompt"] == 99
@@ -2113,7 +2119,9 @@ async def test_old_single_preview_button_cannot_consume_new_single(env):
     )
 
     assert env.client.added == []
-    assert not any(call["download_dir"] == "/downloads/FC2" for call in env.client.added)
+    assert not any(
+        call["download_dir"] == "/downloads/FC2" for call in env.client.added
+    )
     assert (9, 77, None) in env.bot.keyboard_clears
     # 单条状态必须原样保留，用户点正确的预览按钮还能添加。
     assert context.user_data["torrent"]["title"].endswith("SSIS-999")
@@ -2156,9 +2164,7 @@ async def test_batch_preview_failure_clears_old_keyboard_and_blocks_old_button(
     assert context.user_data.get("batch_prompt") is None
 
     await handlers.chooseDownloadDir(
-        make_dir_prompt_update(
-            "magnet:?xt=urn:btih:" + "c" * 40 + "&dn=SSIS-999", 99
-        ),
+        make_dir_prompt_update("magnet:?xt=urn:btih:" + "c" * 40 + "&dn=SSIS-999", 99),
         context,
     )
     assert context.user_data["torrent_prompt"] == 99
@@ -2168,7 +2174,9 @@ async def test_batch_preview_failure_clears_old_keyboard_and_blocks_old_button(
     )
 
     assert env.client.added == []
-    assert not any(call["download_dir"] == "/downloads/FC2" for call in env.client.added)
+    assert not any(
+        call["download_dir"] == "/downloads/FC2" for call in env.client.added
+    )
     assert context.user_data["torrent_prompt"] == 99
 
 
@@ -2198,9 +2206,10 @@ async def test_batch_result_send_failure_retries_and_delivers_summary(env, monke
     assert context.user_data.get("pending_batch_results") is None
     assert any("已添加 9 / 9" in sent["text"] for sent in env.bot.sent)
     # 第一次失败、第二次成功。
-    assert len(
-        [call for call in env.bot.send_attempts if "已添加 9 / 9" in call["text"]]
-    ) == 2
+    assert (
+        len([call for call in env.bot.send_attempts if "已添加 9 / 9" in call["text"]])
+        == 2
+    )
     assert (9, 77, None) in env.bot.keyboard_clears
     summary = next(
         sent["text"] for sent in env.bot.sent if "已添加 9 / 9" in sent["text"]
@@ -2264,7 +2273,9 @@ async def test_single_preview_ownership_includes_chat(env):
     )
 
     assert env.client.added == []
-    assert not any(call["download_dir"] == "/downloads/FC2" for call in env.client.added)
+    assert not any(
+        call["download_dir"] == "/downloads/FC2" for call in env.client.added
+    )
     assert context.user_data["torrent"]["title"].endswith("SSIS-999")
     assert context.user_data["torrent_prompt"] == 77
     assert context.user_data["torrent_prompt_chat"] == 5
@@ -2504,7 +2515,9 @@ async def test_fc2_download_toast_hints_previous_download(env, tmp_path, monkeyp
     assert "原名" in answers[-1]
 
 
-async def test_fc2_mute_missing_seen_still_deletes_callback_cover(env, tmp_path, monkeypatch):
+async def test_fc2_mute_missing_seen_still_deletes_callback_cover(
+    env, tmp_path, monkeypatch
+):
     store = install_fc2_store(monkeypatch, tmp_path)
     assert store.entry("5000545") is None
     update, answers = make_fc2_callback("fc2no:5000545", chat_id=9, message_id=456)
@@ -2516,21 +2529,105 @@ async def test_fc2_mute_missing_seen_still_deletes_callback_cover(env, tmp_path,
     assert handlers._fc2_blacklist().contains("5000545")
 
 
-@pytest.mark.parametrize("record_chat", [None, -100987654321])
-async def test_fc2_mute_legacy_or_other_chat_deletes_only_callback_cover(
-    env, tmp_path, monkeypatch, record_chat
+@pytest.mark.parametrize(
+    "record_extra", [{}, {"chat_id": None}], ids=["missing", "none"]
+)
+async def test_fc2_mute_legacy_chat_deletes_all_attachments(
+    env, tmp_path, monkeypatch, caplog, record_extra
 ):
     store = install_fc2_store(monkeypatch, tmp_path)
-    entry = {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1}
-    if record_chat is not None:
-        entry["chat_id"] = record_chat
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[77, 123, 124, 125, 126, 127, 128, 123],
+    )
+    store.entry("5000545").update(record_extra)
+    update, answers = make_fc2_callback("fc2no:5000545", chat_id=9)
+
+    with caplog.at_level(logging.INFO):
+        await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert env.bot.deleted == [(9, 77)] + [(9, mid) for mid in range(123, 129)]
+    assert answers == ["已拉黑并删除，以后不再推送"]
+    assert "blacklist_written=True delete=7/7" in caplog.text
+    assert handlers._fc2_blacklist().contains("5000545")
+    assert env.bot.keyboard_clears == []
+
+
+@pytest.mark.parametrize("record_chat", [10, "10"])
+async def test_fc2_mute_other_chat_deletes_only_callback_cover(
+    env, tmp_path, monkeypatch, caplog, record_chat
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    entry = {
+        "hash": FC2_HASH,
+        "title": "FC2-PPV-5000545 sample",
+        "pub_ts": 1,
+        "chat_id": record_chat,
+    }
     store.remember("5000545", entry, messages=[77, 123])
     update, answers = make_fc2_callback("fc2no:5000545", chat_id=9)
 
-    await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
+    with caplog.at_level(logging.INFO):
+        await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
 
     assert env.bot.deleted == [(9, 77)]
     assert answers == ["已拉黑并删除，以后不再推送"]
+    assert "blacklist_written=True delete=1/1" in caplog.text
+
+
+@pytest.mark.parametrize("blacklist_written", [True, False])
+async def test_fc2_mute_attachment_delete_failure_warns_and_counts_remaining(
+    env, tmp_path, monkeypatch, caplog, blacklist_written
+):
+    store = install_fc2_store(monkeypatch, tmp_path)
+    blacklist = install_fc2_blacklist(monkeypatch, tmp_path)
+    if not blacklist_written:
+        monkeypatch.setattr(blacklist, "add", lambda *args, **kwargs: None)
+    monkeypatch.setattr(handlers, "_fc2_blacklist", lambda: blacklist)
+    store.remember(
+        "5000545",
+        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1},
+        messages=[77, 123, 124, 123],
+    )
+    update, answers = make_fc2_callback("fc2no:5000545", chat_id=9)
+    attempted = []
+
+    async def delete_attachment(chat_id, message_id):
+        attempted.append((chat_id, message_id))
+        if message_id == 123:
+            raise BadRequest("SYNTHETIC_PRIVATE_TOKEN fake-user=99")
+        env.bot.deleted.append((chat_id, message_id))
+        return True
+
+    monkeypatch.setattr(env.bot, "delete_message", delete_attachment)
+    with caplog.at_level(logging.INFO):
+        await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
+
+    assert attempted == [(9, 77), (9, 123), (9, 124)]
+    assert env.bot.deleted == [(9, 77), (9, 124)]
+    if blacklist_written:
+        assert answers == [
+            "已拉黑，但未能删除全部卡片（已删除 2 张，剩余 1 张；可能超时或权限不足）"
+        ]
+    else:
+        assert answers == ["黑名单写入失败，卡片也未全部删除（已删除 2 张，剩余 1 张）"]
+    assert blacklist.contains("5000545") is blacklist_written
+    failures = [
+        record for record in caplog.records if "stage=delete_message" in record.message
+    ]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.WARNING
+    assert (
+        "number=5000545 msg=123 chat=已脱敏 stage=delete_message exception=BadRequest"
+        in failures[0].message
+    )
+    assert f"blacklist_written={blacklist_written} delete=2/3" in caplog.text
+    assert "SYNTHETIC_PRIVATE_TOKEN" not in caplog.text
+    assert "fake-user" not in caplog.text
+    assert env.bot.keyboard_clears == []
+    assert env.bot.edits == []
+    assert env.bot.sent == []
 
 
 async def test_fc2_mute_delete_failure_clears_keyboard_marks_card_and_logs_safely(
@@ -2541,7 +2638,12 @@ async def test_fc2_mute_delete_failure_clears_keyboard_marks_card_and_logs_safel
     chat_id = -100987654321
     store.remember(
         "5000545",
-        {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1, "chat_id": chat_id},
+        {
+            "hash": FC2_HASH,
+            "title": "FC2-PPV-5000545 sample",
+            "pub_ts": 1,
+            "chat_id": chat_id,
+        },
         messages=[77, 123],
     )
     update, answers = make_fc2_callback("fc2no:5000545", chat_id=chat_id)
@@ -2561,8 +2663,16 @@ async def test_fc2_mute_delete_failure_clears_keyboard_marks_card_and_logs_safel
 
     assert blacklist.contains("5000545")
     assert env.bot.keyboard_clears == [(chat_id, 77, None)]
-    assert captions == [{"chat_id": chat_id, "message_id": 77, "caption": "🚫 已拉黑\nFC2-PPV-5000545 sample"}]
-    assert answers == ["已拉黑，但未能删除全部卡片（可能超时或权限不足）"]
+    assert captions == [
+        {
+            "chat_id": chat_id,
+            "message_id": 77,
+            "caption": "🚫 已拉黑\nFC2-PPV-5000545 sample",
+        }
+    ]
+    assert answers == [
+        "已拉黑，但未能删除全部卡片（已删除 0 张，剩余 2 张；可能超时或权限不足）"
+    ]
     assert "stage=delete_message exception=BadRequest" in caplog.text
     assert "blacklist_written=True delete=0/2" in caplog.text
     assert "user=授权一致 chat=已脱敏" in caplog.text
@@ -2591,7 +2701,7 @@ async def test_fc2_mute_write_and_delete_failure_never_claims_success(
     with caplog.at_level(logging.INFO):
         await handlers.fc2_mute(update, SimpleNamespace(user_data={}, bot=env.bot))
 
-    assert answers == ["黑名单写入失败，卡片也未全部删除"]
+    assert answers == ["黑名单写入失败，卡片也未全部删除（已删除 0 张，剩余 1 张）"]
     assert env.bot.keyboard_clears == [(9, 77, None)]
     assert env.bot.edits[-1]["text"].startswith("⚠️ 黑名单写入失败\n")
     assert "已拉黑" not in env.bot.edits[-1]["text"]
@@ -2617,8 +2727,14 @@ async def test_fc2_callbacks_denied_before_stores_with_redacted_info_and_warning
     assert env.client.added == []
     assert env.bot.deleted == []
     assert env.bot.keyboard_clears == []
-    assert any(record.levelno == logging.INFO and "回调入口" in record.message for record in caplog.records)
-    assert any(record.levelno == logging.WARNING and "stage=authorization" in record.message for record in caplog.records)
+    assert any(
+        record.levelno == logging.INFO and "回调入口" in record.message
+        for record in caplog.records
+    )
+    assert any(
+        record.levelno == logging.WARNING and "stage=authorization" in record.message
+        for record in caplog.records
+    )
     assert "user=授权不一致 chat=已脱敏" in caplog.text
     assert "987654321" not in caplog.text
 
@@ -2628,7 +2744,9 @@ async def test_fc2_download_string_super_user_and_result_info(
 ):
     handlers.bot_config.config["bot"]["super_user"] = "9"
     store = install_fc2_store(monkeypatch, tmp_path)
-    store.remember("5000545", {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1})
+    store.remember(
+        "5000545", {"hash": FC2_HASH, "title": "FC2-PPV-5000545 sample", "pub_ts": 1}
+    )
     update, answers = make_fc2_callback("fc2dl:5000545")
     with caplog.at_level(logging.INFO):
         await handlers.fc2_download(update, SimpleNamespace(user_data={}, bot=env.bot))
@@ -2639,16 +2757,25 @@ async def test_fc2_download_string_super_user_and_result_info(
     assert "fc2dl 回调结果 number=5000545 result=added" in caplog.text
 
 
-@pytest.mark.parametrize("data,callback", [("fc2dl:5000545", handlers.fc2_download), ("fc2no:5000545", handlers.fc2_mute)])
+@pytest.mark.parametrize(
+    "data,callback",
+    [("fc2dl:5000545", handlers.fc2_download), ("fc2no:5000545", handlers.fc2_mute)],
+)
 def test_fc2_callback_registration_precedes_generic_fallback(data, callback):
     from telegram import CallbackQuery, Chat, Message, Update, User
     from telegram.ext import CallbackQueryHandler
 
     user = User(9, "synthetic", False)
     message = Message(77, dt.datetime(2026, 11, 6), Chat(9, "private"), from_user=user)
-    query = CallbackQuery("synthetic-query", user, "synthetic-instance", message=message, data=data)
+    query = CallbackQuery(
+        "synthetic-query", user, "synthetic-instance", message=message, data=data
+    )
     update = Update(1, callback_query=query)
-    callbacks = [handler for handler in handlers.HANDLERS if isinstance(handler, CallbackQueryHandler)]
+    callbacks = [
+        handler
+        for handler in handlers.HANDLERS
+        if isinstance(handler, CallbackQueryHandler)
+    ]
     matches = [handler for handler in callbacks if handler.check_update(update)]
 
     assert matches[0].callback is callback
@@ -2671,6 +2798,7 @@ async def test_fc2_download_writes_shared_hash_claim_on_success_or_duplicate(
         {"hash": key, "title": "FC2-PPV-4972315 sample", "pub_ts": 1},
     )
     if duplicate:
+
         def already_added(**kwargs):
             assert kwargs["notify"] is False
             raise handlers.TorrentAlreadyExists(key)
@@ -2732,7 +2860,8 @@ async def test_fc2_private_magnet_handoff_has_only_downloader_notice(
         env.client,
         "get_torrent",
         lambda lookup: next(
-            torrent for torrent in env.client.torrents
+            torrent
+            for torrent in env.client.torrents
             if torrent.info_hash == lookup or torrent.id == lookup
         ),
     )
@@ -2879,6 +3008,7 @@ async def test_fc2_private_duplicate_magnet_records_claim_without_progress_card(
         env.client.existing = {key: FakeTorrent(7, "9KG", "/downloads/FC2")}
         data = {"batch": extract_magnets(raw)}
     else:
+
         def already_added(**kwargs):
             assert kwargs["notify"] is False
             raise handlers.TorrentAlreadyExists(key)
@@ -2931,7 +3061,13 @@ async def test_fc2_handoff_add_failure_logs_only_number_stage_and_exception(
         )
 
     assert "number=4972315 stage=add_torrent exception=TimeoutError" in caplog.text
-    for secret in ("SECRET", "987654321", "api.telegram.org", "private-key", "tracker.invalid"):
+    for secret in (
+        "SECRET",
+        "987654321",
+        "api.telegram.org",
+        "private-key",
+        "tracker.invalid",
+    ):
         assert secret not in caplog.text
     assert DownloadQueue.size() == 0
     assert not (tmp_path / "shared" / "fc2_claims.jsonl").exists()
