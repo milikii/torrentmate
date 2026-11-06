@@ -24,9 +24,11 @@ class QueueEntry:
     lang_code: str | None = None
     title: str = ""
     requested_dir: str = ""
-    # 持久化时保存 info_hash，重启后按旧数字 ID 查到的任务若 hash 不符
-    # 说明 ID 已被别的任务复用，必须停止对它做移动/完成等自动操作。
+    # 数字 ID 可能变化或被复用；监控按 info_hash 查找并批量重键队列。
     info_hash: str | None = None
+    # 任务来源：fc2-card / manual / batch / unknown（历史条目没有这个字段，
+    # from_json 只认已知字段 + dataclass 默认值，旧队列文件照常能读）。
+    source: str = "unknown"
     auto_classify: bool = False
     message_id: int | None = None
     # 批量添加时，任务过多就不为每个任务单独发进度卡片
@@ -43,6 +45,9 @@ class QueueEntry:
     last_classify_fail_ts: float = 0.0
     notified_error: bool = False
     notified_stalled: bool = False
+    # 上次停滞提醒的发送时间；同一任务两次提醒至少间隔 6 小时
+    # （见 DownloadMonitor.STALLED_NOTIFY_INTERVAL）。
+    last_stalled_notify_ts: float = 0.0
     last_progress_ts: float = field(default_factory=time.time)
     last_progress_value: float = -1.0
     finished: bool = False
@@ -139,11 +144,17 @@ class DownloadQueue:
             return cls._items.get(int(torrent_id))
 
     @classmethod
-    def remove(cls, torrent_id: int) -> QueueEntry | None:
+    def remove(
+        cls, torrent_id: int, info_hash: str | None = None
+    ) -> QueueEntry | None:
         with cls._lock:
-            entry = cls._items.pop(int(torrent_id), None)
-        if entry is not None:
-            cls._save()
+            entry = cls._items.get(int(torrent_id))
+            if entry is None:
+                return None
+            if info_hash and str(entry.info_hash or "").lower() != info_hash.lower():
+                return None
+            del cls._items[int(torrent_id)]
+        cls._save()
         return entry
 
     @classmethod
@@ -162,10 +173,53 @@ class DownloadQueue:
             return result
 
     @classmethod
+    def rekey(cls, entries: dict[int, QueueEntry]) -> set[int]:
+        """一次替换本轮已定位的键，避免两个 ID 互换时覆盖另一条任务。"""
+        with cls._lock:
+            updates = {
+                old_id: entry
+                for old_id, entry in entries.items()
+                if old_id in cls._items
+                and str(cls._items[old_id].info_hash or "").lower()
+                == str(entry.info_hash or "").lower()
+            }
+            destinations: dict[int, list[int]] = {}
+            for old_id, entry in updates.items():
+                destinations.setdefault(entry.torrent_id, []).append(old_id)
+            for old_ids in destinations.values():
+                if len(old_ids) > 1:
+                    for old_id in old_ids:
+                        updates.pop(old_id)
+            # 未能读取的任务仍占着旧键时，本轮保留双方，不能用新键覆盖它。
+            while True:
+                blocked = {
+                    old_id
+                    for old_id, entry in updates.items()
+                    if entry.torrent_id in cls._items
+                    and entry.torrent_id not in updates
+                }
+                if not blocked:
+                    break
+                for old_id in blocked:
+                    updates.pop(old_id)
+            if not updates:
+                return set()
+            for old_id in updates:
+                del cls._items[old_id]
+            for entry in updates.values():
+                cls._items[entry.torrent_id] = entry
+            cls._save()
+            return set(updates)
+
+    @classmethod
     def update(cls, entry: QueueEntry) -> None:
         with cls._lock:
-            if entry.torrent_id not in cls._items:
+            current = cls._items.get(entry.torrent_id)
+            if current is None:
                 # 条目已在别处被删除（完成/不存在），不要把它复活回来。
+                return
+            if str(current.info_hash or "").lower() != str(entry.info_hash or "").lower():
+                # 旧快照的数字 ID 已属于另一个 hash，不能覆盖它。
                 return
             cls._items[entry.torrent_id] = entry
         cls._save()

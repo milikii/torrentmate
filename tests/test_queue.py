@@ -168,3 +168,92 @@ def test_add_if_new_is_atomic_for_concurrent_same_task_inserts():
         assert DownloadQueue.get(loser.torrent_id) is None
     finally:
         DownloadQueue.clear()
+
+
+def test_rekey_swapped_ids_persists_and_rejects_old_snapshot(tmp_path):
+    state = tmp_path / "queue.json"
+    try:
+        DownloadQueue.set_state_file(str(state))
+        DownloadQueue.clear()
+        DownloadQueue.add(QueueEntry(torrent_id=1, chat_id=9, info_hash="a" * 40, message_id=101))
+        DownloadQueue.add(QueueEntry(torrent_id=2, chat_id=10, info_hash="b" * 40, message_id=202))
+        stale = DownloadQueue.snapshot()[1]
+        updates = DownloadQueue.snapshot()
+        updates[1].torrent_id = 2
+        updates[2].torrent_id = 1
+
+        assert DownloadQueue.rekey(updates) == {1, 2}
+        DownloadQueue._items.clear()
+        DownloadQueue.load()
+        first = DownloadQueue.get(1)
+        second = DownloadQueue.get(2)
+        assert first is not None and first.info_hash == "b" * 40
+        assert second is not None and second.info_hash == "a" * 40
+        assert first.message_id == 202
+        assert second.message_id == 101
+        stored = json.loads(state.read_text(encoding="utf-8"))
+        assert {item["torrent_id"]: item["info_hash"] for item in stored} == {1: "b" * 40, 2: "a" * 40}
+
+        stale.message_id = 999
+        DownloadQueue.update(stale)
+        assert DownloadQueue.get(1) is first
+        assert first.message_id == 202
+        assert DownloadQueue.remove(1, "a" * 40) is None
+        assert DownloadQueue.get(1) is first
+        assert DownloadQueue.remove(2, "a" * 40) is second
+        assert DownloadQueue.get(1) is first
+    finally:
+        DownloadQueue.set_state_file(None)
+        DownloadQueue.clear()
+
+
+def test_rekey_preserves_unresolved_destination():
+    try:
+        DownloadQueue.set_state_file(None)
+        DownloadQueue.clear()
+        first = QueueEntry(torrent_id=1, chat_id=9, info_hash="a" * 40)
+        second = QueueEntry(torrent_id=2, chat_id=10, info_hash="b" * 40)
+        DownloadQueue.add(first)
+        DownloadQueue.add(second)
+        update = DownloadQueue.snapshot()[1]
+        update.torrent_id = 2
+
+        assert DownloadQueue.rekey({1: update}) == set()
+        assert DownloadQueue.get(1) is first
+        assert DownloadQueue.get(2) is second
+    finally:
+        DownloadQueue.clear()
+
+
+def test_rekey_does_not_revive_removed_entry():
+    try:
+        DownloadQueue.set_state_file(None)
+        DownloadQueue.clear()
+        DownloadQueue.add(QueueEntry(torrent_id=1, chat_id=9, info_hash="a" * 40))
+        update = DownloadQueue.snapshot()[1]
+        update.torrent_id = 2
+        DownloadQueue.remove(1)
+
+        assert DownloadQueue.rekey({1: update}) == set()
+        assert DownloadQueue.size() == 0
+    finally:
+        DownloadQueue.clear()
+
+
+def test_rekey_duplicate_destinations_preserves_entries():
+    try:
+        DownloadQueue.set_state_file(None)
+        DownloadQueue.clear()
+        DownloadQueue.add(QueueEntry(torrent_id=1, chat_id=9, info_hash="a" * 40))
+        DownloadQueue.add(QueueEntry(torrent_id=2, chat_id=10, info_hash="b" * 40))
+        updates = DownloadQueue.snapshot()
+        for entry in updates.values():
+            entry.torrent_id = 3
+
+        assert DownloadQueue.rekey(updates) == set()
+        assert DownloadQueue.get(1) is not None
+        assert DownloadQueue.get(2) is not None
+        assert DownloadQueue.get(3) is None
+        assert DownloadQueue.size() == 2
+    finally:
+        DownloadQueue.clear()

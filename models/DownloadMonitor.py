@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import json
+import math
 import os
 import time
 from typing import Any
@@ -13,14 +16,35 @@ from telegram.error import TelegramError
 from transmission_rpc.torrent import Torrent
 
 from lib.classifier import get_classifier
-from lib.constants import PROGRESS_EDIT_INTERVAL, QUEUE_CHECK_INTERVAL
+from lib.constants import CONFIG_FILE, PROGRESS_EDIT_INTERVAL, QUEUE_CHECK_INTERVAL
 from lib.func import escape_html, get_logger, speed_to_human, trans
 from lib.render import render_done_card, render_progress_card
 from models.BotConfigurator import BotConfigurator
+from models.DoneList import (
+    SOURCE_UNKNOWN,
+    WRITE_FAILED,
+    DoneDeletionQueue,
+    DoneList,
+    config_path as done_config_path,
+    pending_config_path as done_pending_config_path,
+)
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue, QueueEntry
+from models.Fc2Blacklist import Fc2Blacklist
+from models.Fc2Blacklist import config_path as blacklist_config_path
+from models.Fc2Channel import extract_number
+from models.Fc2Claims import Fc2Claims
+from models.Fc2Claims import config_path as claims_config_path
 
 log = get_logger("DownloadMonitor")
+
+# 接管基线状态文件，和主配置文件同目录；只记录“从哪一刻开始接管”，
+# 不写进 torrentino.yaml，避免动到用户配置项。
+ADOPT_BASELINE_FILE = "fc2_adopt_baseline.json"
+
+# 同一任务两次停滞提醒的最小间隔（秒）。进度动一点又停不算新的一轮，
+# 6 小时内不再提醒；超过后再次停滞才会再发。
+STALLED_NOTIFY_INTERVAL = 6 * 3600
 
 
 class DownloadMonitor:
@@ -51,6 +75,21 @@ class DownloadMonitor:
         self.pause_on_complete = bool(
             self.config.get("transmission.pause_on_complete", False)
         )
+        # FC2 专用机器人（fc2.enabled=true）只负责推送，不再发停滞提醒：
+        # 两个机器人各只有自己的 token，无法跨机器人发送；停滞提醒统一由
+        # 下载机器人（含它部署后接管的新 FC2 下载）发出。
+        self.fc2_enabled = bool(self.config.get("fc2.enabled", False))
+        # FC2 任务通知分流：只有下载机器人（fc2.enabled=false）接管 FC2
+        # 任务；fc2bot 配置里 fc2.enabled=true，永远不接管，避免两份通知。
+        self.adopt_fc2 = bool(self.config.get("notify.adopt_fc2", True)) and not bool(
+            self.config.get("fc2.enabled", False)
+        )
+        # 成功名单与待删卡片队列都落共享目录：两个机器人配同一个
+        # fc2.done_file 就能查到同一份记录；待删文件默认紧挨着它。
+        self.done_list = DoneList(done_config_path(self.config))
+        self.done_deletions = DoneDeletionQueue(done_pending_config_path(self.config))
+        self.fc2_claims = Fc2Claims(claims_config_path(self.config))
+        self._super_user_warned = False
 
     async def run(self) -> None:
         log.info("下载监控已启动，轮询间隔 %s 秒", self.interval)
@@ -64,36 +103,273 @@ class DownloadMonitor:
             await asyncio.sleep(self.interval)
 
     async def tick(self) -> None:
+        # 先发现再取快照：刚接管的 FC2 任务同一轮就能发出第一张卡。
+        # 发现失败只记日志，不能影响原有队列的处理。
+        await self._maybe_adopt_fc2()
         entries = DownloadQueue.snapshot()
         if not entries:
             return
+        resolved: dict[int, tuple[Torrent, QueueEntry]] = {}
         for torrent_id, entry in entries.items():
+            entry_hash = str(entry.info_hash or "").lower()
+            lookup = entry_hash or torrent_id
             try:
-                torrent = await asyncio.to_thread(self.client.get_torrent, torrent_id)
+                torrent = await asyncio.to_thread(self.client.get_torrent, lookup)
             except KeyError:
-                log.warning("任务 %s 已不存在，移出通知队列", torrent_id)
-                DownloadQueue.remove(torrent_id)
+                if DownloadQueue.remove(torrent_id, entry.info_hash) is not None:
+                    log.warning("任务 %s 已不存在，移出通知队列 stage=lookup", torrent_id)
                 continue
             except Exception as err:  # noqa: BLE001
-                log.warning("读取任务 %s 状态失败: %s", torrent_id, err)
+                log.warning(
+                    "读取任务 %s 状态失败 stage=lookup exception=%s",
+                    torrent_id,
+                    type(err).__name__,
+                )
                 continue
-            # 队列只存数字 ID，Transmission 重启/删种后 ID 可能被别的任务
-            # 复用：hash 对不上就停止对这个条目做一切自动操作，避免移错、
-            # 删错、通知错任务；旧条目（无 hash）不受影响。
-            entry_hash = (entry.info_hash or "").lower() or None
-            torrent_hash = str(getattr(torrent, "info_hash", "") or "").lower() or None
-            if entry_hash and torrent_hash and entry_hash != torrent_hash:
-                log.error(
-                    "任务 %s 的 info_hash 与队列记录不符（可能 ID 被复用），"
-                    "停止处理并移出队列",
+            torrent_hash = str(getattr(torrent, "info_hash", "") or "").lower()
+            if entry_hash and torrent_hash != entry_hash:
+                log.warning(
+                    "任务 %s 按 hash 查询未能核实匹配，保留队列且停止本轮处理 stage=lookup_hash",
                     torrent_id,
                 )
-                DownloadQueue.remove(torrent_id)
                 continue
+            entry.torrent_id = int(torrent.id)
+            resolved[torrent_id] = (torrent, entry)
+
+        applied = DownloadQueue.rekey(
+            {torrent_id: entry for torrent_id, (_, entry) in resolved.items()}
+        )
+        for old_id, (torrent, entry) in resolved.items():
+            if old_id not in applied:
+                log.warning("任务 %s 队列键冲突，保留等待下轮 stage=queue_rekey", old_id)
+                continue
+            if old_id != entry.torrent_id:
+                log.info("任务通知队列重键 old_id=%s torrent_id=%s", old_id, entry.torrent_id)
             try:
                 await self.handle(torrent, entry)
             except Exception as err:  # noqa: BLE001
-                log.exception("处理任务 %s 通知失败: %s", torrent_id, err)
+                log.error(
+                    "处理任务 %s 通知失败 stage=handle exception=%s",
+                    entry.torrent_id,
+                    type(err).__name__,
+                )
+
+    async def _maybe_adopt_fc2(self) -> None:
+        """接管 FC2 任务；失败只记日志，不影响原有队列的处理。"""
+        if not self.adopt_fc2:
+            return
+        try:
+            await self._adopt_fc2_torrents()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            log.warning(
+                "接管 FC2 任务失败 stage=adopt_torrents exception=%s", type(err).__name__
+            )
+
+    async def _adopt_fc2_torrents(self) -> None:
+        """把基线之后新加的未完成 FC2 任务接管进通知队列。
+
+        基线（ADOPT_BASELINE_FILE）在部署后第一次接管时以当前时间建立，
+        之后持久保存：只有 addedDate 晚于基线的任务才算“部署后新加”，
+        老任务一律不接管、不通知、不移动。
+
+        只接管有共享 claim 或标题能提出严格 FC2 编号、且尚未完成的任务：
+        - 已完成任务不碰，完成卡发过、队列已清后不会被重新捡回来重发；
+        - 已在队列里的（同 torrent_id 或同 info_hash）跳过；
+        - 共享黑名单命中的跳过；黑名单读盘失败本轮也跳过，下轮再判。
+        """
+        cutoff = self._ensure_adopt_baseline()
+        if cutoff is None:
+            return
+
+        torrents = await asyncio.to_thread(self.client.get_torrents)
+        if not torrents:
+            return
+
+        queued = DownloadQueue.snapshot()
+        known_ids = set(queued)
+        known_hashes = {
+            str(entry.info_hash).lower() for entry in queued.values() if entry.info_hash
+        }
+        candidates = self._fc2_adopt_candidates(
+            torrents, known_ids, known_hashes, cutoff
+        )
+        if not candidates:
+            return
+
+        chat_id = self._adopt_chat_id()
+        if chat_id is None:
+            return
+
+        blacklist = Fc2Blacklist(blacklist_config_path(BotConfigurator()))
+        for torrent, number, torrent_hash in candidates:
+            self._adopt_entry(torrent, number, torrent_hash, chat_id, blacklist)
+
+    def _adopt_baseline_path(self) -> str:
+        """接管基线状态文件：与主配置文件同目录（测试里随 config_file 走）。"""
+        config_file = getattr(BotConfigurator, "config_file", "") or CONFIG_FILE
+        return os.path.join(os.path.dirname(config_file) or ".", ADOPT_BASELINE_FILE)
+
+    def _ensure_adopt_baseline(self) -> float | None:
+        """读取接管基线；第一次运行时以当前时间建立并原子落盘。
+
+        基线文件缺失（首次部署）时写入当前时间，本轮不会有任务的
+        addedDate 晚于它，因此第一轮不接管任何已有任务。
+        文件存在但读不出/内容无效时返回 None（本轮不接管），绝不静默
+        重置基线——否则重启后老任务会被当成新任务重新接管。
+        """
+        path = self._adopt_baseline_path()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            raw = data["adopted_since"]
+            if isinstance(raw, bool):
+                raise TypeError("adopted_since 不是数字")
+            cutoff = float(raw)
+        except FileNotFoundError:
+            cutoff = time.time()
+            try:
+                self._write_adopt_baseline(path, cutoff)
+            except OSError as err:
+                log.warning("写入 FC2 接管基线失败: %s", err)
+                return None
+            log.info("FC2 接管基线已建立: %s", cutoff)
+            return cutoff
+        except (OSError, ValueError, TypeError, KeyError) as err:
+            log.error("读取 FC2 接管基线失败（%s），本轮不接管 FC2 任务", err)
+            return None
+        if not math.isfinite(cutoff) or cutoff < 0:
+            log.error("FC2 接管基线无效（%s），本轮不接管 FC2 任务", cutoff)
+            return None
+        return cutoff
+
+    @staticmethod
+    def _write_adopt_baseline(path: str, cutoff: float) -> None:
+        """原子写基线文件（临时文件 + os.replace）。"""
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "adopted_since": cutoff,
+                    "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+                fh,
+            )
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _torrent_added_timestamp(torrent: Torrent) -> float | None:
+        """取任务 addedDate 的 Unix 时间戳；拿不到时返回 None。
+
+        transmission-rpc 7.0.11 的 Torrent 暴露的是 ``added_date``
+        （RPC 字段 addedDate，datetime；本项目现有完成耗时计算也在用它）。
+        aware datetime 直接取绝对时间；naive datetime 按进程本地时区解释，
+        与 ``datetime.fromtimestamp(addedDate)`` 互为逆运算。其它类型一律
+        视为不可用，调用方据此跳过，宁可漏接管也不接管老任务。
+        """
+        try:
+            value = getattr(torrent, "added_date", None)
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(value, dt.datetime):
+            try:
+                return value.timestamp()
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return number if math.isfinite(number) else None
+        return None
+
+    def _fc2_identity(
+        self, torrent: Torrent, entry: QueueEntry | None = None
+    ) -> tuple[str | None, str, bool]:
+        """共享 hash 归属优先；旧任务无 claim 时仍从真实名称提取编号。"""
+        info_hash = str(
+            getattr(torrent, "info_hash", "") or (entry.info_hash if entry else "") or ""
+        ).lower()
+        claim = self.fc2_claims.find(info_hash)
+        name = str(getattr(torrent, "name", "") or (entry.title if entry else "") or "")
+        if claim is None:
+            return extract_number(name), name, False
+        number = claim.get("number") or extract_number(name)
+        return number, str(claim.get("title") or name), True
+
+    def _fc2_adopt_candidates(
+        self,
+        torrents: list[Torrent],
+        known_ids: set[int],
+        known_hashes: set[str],
+        cutoff: float,
+    ) -> list[tuple[Torrent, str | None, str]]:
+        """挑出基线之后添加、尚未在通知队列里的未完成 FC2 任务。"""
+        candidates: list[tuple[Torrent, str | None, str]] = []
+        for torrent in torrents:
+            # 防复活：只发现未完成任务，完成/做种中的一律不碰。
+            if float(torrent.percent_done or 0) >= 1 or torrent.status == "seeding":
+                continue
+            number, _title, claimed = self._fc2_identity(torrent)
+            if not number and not claimed:
+                continue
+            # 只接管部署基线之后新加的任务；添加时间不可用时也不接管。
+            added_at = self._torrent_added_timestamp(torrent)
+            if added_at is None or added_at <= cutoff:
+                continue
+            torrent_hash = str(getattr(torrent, "info_hash", "") or "").lower()
+            if torrent.id in known_ids:
+                continue
+            if torrent_hash and torrent_hash in known_hashes:
+                continue
+            candidates.append((torrent, number, torrent_hash))
+        return candidates
+
+    def _adopt_chat_id(self) -> int | None:
+        """取接管通知的接收 chat；未配置 bot.super_user 时每轮只警告一次。"""
+        try:
+            chat_id = int(self.config.get("bot.super_user"))
+        except (TypeError, ValueError):
+            chat_id = None
+        if chat_id is not None:
+            return chat_id
+        if not self._super_user_warned:
+            log.warning("未配置 bot.super_user，本轮不接管 FC2 任务")
+            self._super_user_warned = True
+        return None
+
+    def _adopt_entry(
+        self,
+        torrent: Torrent,
+        number: str | None,
+        torrent_hash: str,
+        chat_id: int,
+        blacklist: Fc2Blacklist,
+    ) -> None:
+        """黑名单通过后把任务加进通知队列。"""
+        record, read_ok = blacklist.lookup(number)
+        if record is not None or not read_ok:
+            return
+        entry = QueueEntry(
+            torrent_id=int(torrent.id),
+            chat_id=chat_id,
+            lang_code="zh",
+            title=str(torrent.name or ""),
+            requested_dir=str(torrent.download_dir or ""),
+            info_hash=torrent_hash or None,
+            auto_classify=True,
+            # 接管进来的任务不是用户此刻主动添加的，来源无法判定，记 unknown。
+            source=SOURCE_UNKNOWN,
+        )
+        if not DownloadQueue.add_if_new(entry):
+            return
+        log.info("接管 FC2 任务 %s（编号 %s）", torrent.name, number)
 
     async def handle(self, torrent: Torrent, entry: QueueEntry) -> None:
         # 1. 任务出错，只提醒一次：先发送，确认送达才标记已通知，
@@ -140,7 +416,15 @@ class DownloadMonitor:
             return True
 
         classifier = get_classifier()
-        result = classifier.classify(torrent.name)
+        classify_name = torrent.name
+        number, claim_title, claimed = self._fc2_identity(torrent, entry)
+        if claimed and number and not extract_number(classify_name):
+            classify_name = (
+                claim_title
+                if extract_number(claim_title) == number
+                else f"FC2-PPV-{number}"
+            )
+        result = classifier.classify(classify_name)
         target = classifier.resolve_path(result.directory) or entry.requested_dir
 
         if not target or os.path.normpath(str(target)) == os.path.normpath(
@@ -192,20 +476,61 @@ class DownloadMonitor:
         return True
 
     async def _complete(self, torrent: Torrent, entry: QueueEntry) -> None:
-        elapsed = None
-        try:
-            if torrent.done_date and torrent.added_date:
-                elapsed = (torrent.done_date - torrent.added_date).total_seconds()
-        except Exception:  # noqa: BLE001
-            elapsed = None
-
+        elapsed = self._elapsed_seconds(torrent)
         text = render_done_card(torrent, entry.lang_code, None, elapsed)
         keyboard = self._done_keyboard(torrent, entry.lang_code)
         log.info("下载完成: %s -> %s", torrent.name, torrent.download_dir)
 
         # 先确认完成卡片真的送达，再写历史、清队列：之前是先标记
         # finished、直接清队列，发送失败时完成通知就永久丢失了。
-        delivered = False
+        delivered, delete_message_id = await self._deliver_done_card(
+            entry, text, keyboard
+        )
+        if not delivered:
+            log.warning("完成卡片发送失败，任务 %s 保留在队列中下轮重试", torrent.id)
+            # 通知失败也不能跳过暂停：否则任务会一直做种，
+            # 原来的 pause_on_complete 开关就失效了。
+            await self._pause_after_complete(torrent)
+            return
+
+        entry.finished = True
+        DownloadHistory.add(
+            torrent.done_date,
+            torrent.name,
+            torrent.download_dir,
+            torrent.size_when_done,
+        )
+        # 成功名单只在这里写：完成卡没送达时上面已经 return，不会写。
+        self._record_done(torrent, entry)
+        DownloadQueue.remove(torrent.id)
+
+        # 只删“原地编辑成完成卡”的那条旧进度卡；新发的完成消息是用户
+        # 唯一的完成提醒，必须留着。删卡失败只记日志，不影响已经写好的
+        # 历史和成功名单。
+        await self._delete_card(entry.chat_id, delete_message_id)
+
+        if self.pause_on_complete and torrent.status == "seeding":
+            await self._pause_and_notify(torrent, entry)
+
+    @staticmethod
+    def _elapsed_seconds(torrent: Torrent) -> float | None:
+        try:
+            if torrent.done_date and torrent.added_date:
+                return (torrent.done_date - torrent.added_date).total_seconds()
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    async def _deliver_done_card(self, entry: QueueEntry, text, keyboard):
+        """发送（或原地更新）完成卡，返回（是否送达, 完成后可删的消息 id）。
+
+        只有把原进度卡原地编辑成完成卡时，才返回这条旧卡片的 id（之后
+        可以删）。以下情况都返回 None，新发的完成消息一律保留：
+        - 本来就没有进度卡（批量添加、notify.progress=false、初始卡
+          发送失败）：新消息是用户唯一的完成提醒；
+        - 编辑旧卡失败、回退新发：旧卡保持不变（宁可留着也不误删用户
+          可见的内容），新消息同样保留。
+        """
         if entry.message_id:
             try:
                 await self.bot.edit_message_text(
@@ -216,39 +541,84 @@ class DownloadMonitor:
                     reply_markup=keyboard,
                     disable_web_page_preview=True,
                 )
-                delivered = True
+                return True, entry.message_id
             except TelegramError as err:
                 log.debug("进度卡片更新失败，改为发送新消息: %s", err)
-                delivered = (await self._send(entry, text, keyboard)) is not None
-        else:
-            delivered = (await self._send(entry, text, keyboard)) is not None
+        message = await self._send(entry, text, keyboard)
+        if message is None:
+            return False, None
+        return True, None
 
-        if not delivered:
-            log.warning("完成卡片发送失败，任务 %s 保留在队列中下轮重试", torrent.id)
-            # 通知失败也不能跳过暂停：否则任务会一直做种，
-            # 原来的 pause_on_complete 开关就失效了。
-            if self.pause_on_complete and torrent.status == "seeding":
-                try:
-                    await asyncio.to_thread(self.client.stop_torrent, torrent.id)
-                except Exception as err:  # noqa: BLE001
-                    log.warning("完成后暂停失败: %s", err)
+    async def _pause_after_complete(self, torrent: Torrent) -> None:
+        """完成卡没送达时也要暂停；失败只记日志。"""
+        if not (self.pause_on_complete and torrent.status == "seeding"):
             return
+        try:
+            await asyncio.to_thread(self.client.stop_torrent, torrent.id)
+        except Exception as err:  # noqa: BLE001
+            log.warning("完成后暂停失败: %s", err)
 
-        entry.finished = True
-        DownloadHistory.add(
-            torrent.done_date,
-            torrent.name,
-            torrent.download_dir,
-            torrent.size_when_done,
-        )
-        DownloadQueue.remove(torrent.id)
+    async def _pause_and_notify(self, torrent: Torrent, entry: QueueEntry) -> None:
+        """完成后暂停并通知；原逻辑两步在同一个 try 里，任一失败都只记日志。"""
+        try:
+            await asyncio.to_thread(self.client.stop_torrent, torrent.id)
+            await self._send(entry, trans("PAUSED_ON_COMPLETE", entry.lang_code))
+        except Exception as err:  # noqa: BLE001
+            log.warning("完成后暂停失败: %s", err)
 
-        if self.pause_on_complete and torrent.status == "seeding":
-            try:
-                await asyncio.to_thread(self.client.stop_torrent, torrent.id)
-                await self._send(entry, trans("PAUSED_ON_COMPLETE", entry.lang_code))
-            except Exception as err:  # noqa: BLE001
-                log.warning("完成后暂停失败: %s", err)
+    def _record_done(self, torrent: Torrent, entry: QueueEntry) -> None:
+        """追加成功名单；FC2 任务同时排进待删卡片队列。
+
+        这一步的任何失败都不许影响完成流程：名单写不进去就记 error，
+        任务照样算完成（下次不会重来），用户也照样收到完成卡。
+        """
+        number, name, _claimed = self._fc2_identity(torrent, entry)
+        info_hash = str(
+            getattr(torrent, "info_hash", "") or entry.info_hash or ""
+        ).lower() or None
+        done_at = getattr(torrent, "done_date", None) or time.time()
+        try:
+            result = self.done_list.append(
+                number=number,
+                title=name,
+                info_hash=info_hash,
+                done_at=done_at,
+                size_when_done=getattr(torrent, "size_when_done", 0) or 0,
+                source=getattr(entry, "source", None) or SOURCE_UNKNOWN,
+            )
+            if result == WRITE_FAILED:
+                log.error("成功名单写入失败 number=%s stage=done_append", number)
+        except Exception as err:  # noqa: BLE001
+            log.error(
+                "成功名单写入异常 number=%s stage=done_append exception=%s",
+                number,
+                type(err).__name__,
+            )
+        if not number:
+            return
+        # 下载机器人删不了 Fc2专用 发的卡片：把编号放进共享待删队列，
+        # Fc2专用 轮询时自己删。写失败只记日志，不影响完成。
+        try:
+            self.done_deletions.request(number, title=name, done_at=done_at)
+        except Exception as err:  # noqa: BLE001
+            log.warning(
+                "写完成待删卡片队列失败 number=%s stage=done_delete_request exception=%s",
+                number,
+                type(err).__name__,
+            )
+
+    async def _delete_card(self, chat_id, message_id) -> None:
+        """删掉自己发的任务卡片；失败、消息已删都只记日志。"""
+        if not message_id:
+            return
+        try:
+            await self.bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+        except Exception as err:  # noqa: BLE001
+            log.warning(
+                "完成任务卡片删除失败 msg=%s chat=已脱敏 stage=delete_card exception=%s",
+                message_id,
+                type(err).__name__,
+            )
 
     def _done_keyboard(
         self, torrent: Torrent, lang_code: str | None
@@ -367,18 +737,28 @@ class DownloadMonitor:
                     DownloadQueue.update(entry)
 
     async def _check_stalled(self, torrent: Torrent, entry: QueueEntry) -> None:
-        if not self.stalled_minutes:
+        # FC2 专用机器人不发停滞提醒：这类任务要么由下载机器人接管后提醒，
+        # 要么（部署前就在 Fc2专用队列里的老任务）不再有停滞提醒。
+        if not self.stalled_minutes or self.fc2_enabled:
             return
+        now = time.time()
         percent = float(torrent.percent_done or 0) * 100
         if percent > float(entry.last_progress_value or 0) + 0.01:
             entry.last_progress_value = percent
-            entry.last_progress_ts = time.time()
+            entry.last_progress_ts = now
             entry.notified_stalled = False
             DownloadQueue.update(entry)
             return
         if entry.notified_stalled:
             return
-        idle = time.time() - float(entry.last_progress_ts or time.time())
+        # 按任务节流：进度动一点又停不算新的一轮，两次提醒至少间隔 6 小时，
+        # 否则“爬一点又停”的任务会反复复位再发。
+        # last_stalled_notify_ts 为 0/None 表示“从未提醒过”，必须跳过节流；
+        # 否则拿它跟 now 相减，在时间戳较小（如测试假时钟）时会把首条提醒吞掉。
+        last_notify_ts = float(entry.last_stalled_notify_ts or 0)
+        if last_notify_ts and now - last_notify_ts < STALLED_NOTIFY_INTERVAL:
+            return
+        idle = now - float(entry.last_progress_ts or now)
         if idle >= self.stalled_minutes * 60:
             speed = speed_to_human(torrent.rate_download)
             sent = await self._send(
@@ -392,6 +772,7 @@ class DownloadMonitor:
             )
             if sent is not None:
                 entry.notified_stalled = True
+                entry.last_stalled_notify_ts = now
                 DownloadQueue.update(entry)
 
     async def _send(self, entry: QueueEntry, text: str, reply_markup: Any = None):
@@ -402,7 +783,14 @@ class DownloadMonitor:
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
             )
         except TelegramError as err:
-            log.warning("向 %s 推送消息失败: %s", entry.chat_id, err)
+            log.warning(
+                "下载通知推送失败 chat=已脱敏 msg=%s stage=send_message exception=%s",
+                entry.message_id,
+                type(err).__name__,
+            )
             return None
