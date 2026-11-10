@@ -23,6 +23,7 @@ from models.Fc2Blacklist import log_startup_path
 from lib.constants import BOT_FOLDER, CONFIG_FILE
 from lib.func import get_logger
 from lib.bot_handlers import HANDLERS, commands, get_torrent_connection
+from lib.polling import PollingBot, PollingUpdater
 
 
 def bot():
@@ -52,9 +53,16 @@ def bot():
     try:
         monitor_task = None
         fc2_task = None
+        polling_updater = PollingUpdater(
+            PollingBot(token=bot_config.get("bot.token")),
+            asyncio.Queue(),
+            super_user=bot_config.get("bot.super_user"),
+            log=log,
+        )
 
         async def post_init(application):
             nonlocal monitor_task, fc2_task
+            polling_updater.application = application
             await application.bot.set_my_commands(commands)
             client = get_torrent_connection()
             monitor_task = application.create_task(
@@ -66,6 +74,9 @@ def bot():
                 name="fc2-channel-poller",
             )
 
+        async def post_stop(_application):
+            await polling_updater.close_supervision()
+
         async def post_shutdown(_application):
             for task in (monitor_task, fc2_task):
                 if task is not None:
@@ -75,13 +86,15 @@ def bot():
 
         app = (
             Application.builder()
-            .token(bot_config.get("bot.token"))
+            .updater(polling_updater)
             .post_init(post_init)
+            .post_stop(post_stop)
             .post_shutdown(post_shutdown)
             .build()
         )
         """Add bot handlers"""
         app.add_handlers(HANDLERS)
+        app.add_error_handler(polling_updater.error_handler)
         """Run the bot until the user presses Ctrl-C"""
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     except InvalidToken:
