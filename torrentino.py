@@ -14,6 +14,7 @@ from contextlib import suppress
 from telegram.ext import Application
 from telegram import Update
 from telegram.error import InvalidToken
+from telegram.request import HTTPXRequest
 from models.BotConfigurator import BotConfigurator
 from models.DownloadHistory import DownloadHistory
 from models.DownloadQueue import DownloadQueue
@@ -53,9 +54,14 @@ def bot():
     try:
         monitor_task = None
         fc2_task = None
+        get_updates_request = HTTPXRequest(connection_pool_size=8, pool_timeout=10.0)
         polling_updater = PollingUpdater(
-            PollingBot(token=bot_config.get("bot.token")),
+            PollingBot(
+                token=bot_config.get("bot.token"),
+                get_updates_request=get_updates_request,
+            ),
             asyncio.Queue(),
+            get_updates_request=get_updates_request,
             super_user=bot_config.get("bot.super_user"),
             log=log,
         )

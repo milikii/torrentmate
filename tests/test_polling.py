@@ -6,11 +6,11 @@ from contextlib import suppress
 from datetime import timedelta
 from inspect import isawaitable
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from telegram import Update
-from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, Updater
 from telegram.request import BaseRequest
 
@@ -110,7 +110,9 @@ class TelegramRequest(BaseRequest):
 
 
 @pytest.fixture
-async def make_application():
+async def make_application(monkeypatch, tmp_path):
+    monkeypatch.setattr(polling, "PROCESS_EXIT_MARKER", tmp_path / "last-exit")
+    monkeypatch.setattr(polling.os, "_exit", Mock(return_value=None))
     applications = []
 
     def make(responses=(), bootstrap_errors=()):
@@ -119,7 +121,11 @@ async def make_application():
             token="42:offline-test", request=request, get_updates_request=request
         )
         updater = polling.PollingUpdater(
-            bot, asyncio.Queue(), super_user=7, log=logging.getLogger("test.polling")
+            bot,
+            asyncio.Queue(),
+            get_updates_request=request,
+            super_user=7,
+            log=logging.getLogger("test.polling"),
         )
         application = Application.builder().updater(updater).build()
         updater.application = application
@@ -325,12 +331,16 @@ async def test_reusing_same_timeout_exception_does_not_bypass_backoff(
     make_application, fast_backoff
 ):
     error = TimedOut()
-    app, updater, request = make_application([error] * 6)
+    app, updater, request = make_application([error] * 6 + [[]])
     await start(app, updater)
-    await eventually(lambda: updater._suspended and updater._recovery_task.done())
-    assert fast_backoff == [20, 20, 40, 80, 150]
-    assert len(request.polls()) == 6
-    assert len(request.alerts()) == 1
+    await eventually(
+        lambda: updater._last_heartbeat is not None and updater._recovery_task.done()
+    )
+    assert fast_backoff == [20, 20, 40, 80, 150, 150]
+    assert len(request.polls()) >= 7
+    assert not updater._suspended
+    assert not updater._restart_times
+    assert not request.alerts()
 
 
 async def test_retry_after_respects_server_cooldown(make_application, fast_backoff):
@@ -465,17 +475,23 @@ async def test_successful_restart_preserves_offset_allowed_updates_and_queue(
 
 
 @pytest.mark.parametrize("update", [None, Update(update_id=1)])
+@pytest.mark.parametrize(
+    "error",
+    [NetworkError("not polling"), BadRequest("Query is too old and response timeout expired")],
+)
 async def test_error_handler_does_not_restart_for_push_or_command_errors(
-    make_application, update, caplog
+    make_application, update, error, caplog
 ):
     app, updater, _request = make_application()
     await start(app, updater)
-    await app.process_error(update=update, error=NetworkError("not polling"))
+    await app.process_error(update=update, error=error)
     assert updater._last_error is None
     assert updater._recovery_task is None
     assert updater.running and app.running
     assert updater._can_poll.is_set()
-    assert "Application error: type=NetworkError" in caplog.text
+    assert not updater._restart_times and updater._client_rebuilds == 0
+    assert f"Application error: type={type(error).__name__}" in caplog.text
+    assert str(error) in caplog.text
 
 
 async def test_empty_batches_are_heartbeats_even_when_users_are_inactive(
@@ -659,7 +675,7 @@ async def test_suspension_and_watchdog_share_one_hour_alert_limit(
     clock.now = polling.ALERT_INTERVAL
     await updater.check_watchdog()
     assert len(request.alerts()) == 2
-    assert "自动重启已暂停，需人工处理" in request.alerts()[1]["text"]
+    assert "自动重启已暂停，每小时重建客户端试恢复" in request.alerts()[1]["text"]
 
 
 async def test_watchdog_runs_on_a_ten_minute_period(
@@ -747,8 +763,11 @@ async def test_torrentino_registers_guard_and_preserves_business_task_lifecycle(
 
     client = SimpleNamespace(monitor_downloads=AsyncMock(side_effect=wait_forever))
     pusher = SimpleNamespace(run=AsyncMock(side_effect=wait_forever))
+    request_factory = Mock(return_value=request)
+    bot_factory = Mock(return_value=bot)
     monkeypatch.setattr(torrentino, "BotConfigurator", lambda: config)
-    monkeypatch.setattr(torrentino, "PollingBot", lambda token: bot)
+    monkeypatch.setattr(torrentino, "HTTPXRequest", request_factory)
+    monkeypatch.setattr(torrentino, "PollingBot", bot_factory)
     monkeypatch.setattr(torrentino.DownloadHistory, "set_log_file", lambda path: None)
     monkeypatch.setattr(torrentino.DownloadQueue, "set_state_file", lambda path: None)
     monkeypatch.setattr(torrentino, "log_startup_path", lambda config: None)
@@ -780,6 +799,11 @@ async def test_torrentino_registers_guard_and_preserves_business_task_lifecycle(
     app = seen["application"]
     updater = app.updater
     assert isinstance(updater, polling.PollingUpdater)
+    request_factory.assert_called_once_with(connection_pool_size=8, pool_timeout=10.0)
+    bot_factory.assert_called_once_with(
+        token="42:offline-test", get_updates_request=request
+    )
+    assert updater._get_updates_request is request
     assert updater.error_handler in app.error_handlers
     assert seen["handlers"] is torrentino.HANDLERS
     assert seen["options"] == {"allowed_updates": Update.ALL_TYPES}
